@@ -1,0 +1,83 @@
+{
+  "schema_version": "1.0",
+  "status": "ok",
+  "run": {
+    "tool_version": "0.1.0",
+    "repo": "eval/repos/py-orders",
+    "mr": "main..case/py-coupon-checkout",
+    "base_sha": "76b496de73fd021c445dd7fed8e935ae1080b90e",
+    "head_sha": "a1a338b5a3eb8d19b523096e520e4a3ec75dabaa",
+    "models": {
+      "strong": "claude-opus-5-5",
+      "fast": "claude-haiku-4-5",
+      "verifier": "claude-opus-5-5"
+    },
+    "started_at": "2026-09-29T06:32:23.489961Z",
+    "duration_s": 86.3,
+    "usage": {
+      "claude-haiku-4-5": {
+        "calls": 2,
+        "prompt_tokens": 6728,
+        "completion_tokens": 1680
+      },
+      "claude-opus-5-5": {
+        "calls": 2,
+        "prompt_tokens": 36167,
+        "completion_tokens": 1434
+      }
+    },
+    "cost_usd": 0.1885
+  },
+  "summary": {
+    "assessment": "The wiring is clean and fits the project: the code goes through the repository, uses the domain errors and clock.utcnow(), writes to the outbox, and has API tests for the happy path and both error paths. There is one real bug in how the discount is calculated. `percent_off` is a whole percent, but it is passed to `percent_of`, which expects basis points, so customers get about 1/100 of the discount they should. The new test is too loose to catch this.",
+    "verdict": "needs_changes",
+    "counts": {
+      "by_severity": {
+        "major": 1
+      },
+      "by_category": {
+        "correctness": 1
+      }
+    }
+  },
+  "requirements": null,
+  "findings": [
+    {
+      "id": "ef953d916699",
+      "file": "app/services/orders.py",
+      "line_start": 59,
+      "line_end": 59,
+      "severity": "major",
+      "category": "correctness",
+      "message": "The discount is 100\u00d7 too small because `coupon.percent_off` (a whole percent, 1\u2013100) is passed to `percent_of`, which expects basis points.",
+      "rationale": "`percent_of` divides by 10_000 (\"basis_points / 10_000 of amount_cents\"). A SPRING15 coupon on a $50.00 subtotal comes out as 8 cents instead of $7.50, so every coupon order is overcharged, and the CRM gets the wrong `discount_cents` in the `order.created` payload. The new test only checks `discount_cents > 0`, so it passes with the wrong value.",
+      "suggestion": "Use `percent_of(subtotal_cents, coupon.percent_off * 100)`, and make the test assert the exact numbers: `discount_cents == 750` and `total_cents == 4250`.",
+      "evidence": [
+        {
+          "kind": "callee",
+          "ref": "app/core/money.py:10-16",
+          "note": "percent_of(amount_cents, basis_points) divides by BPS_DENOMINATOR"
+        },
+        {
+          "kind": "sibling",
+          "ref": "app/schemas/coupon.py:8",
+          "note": "percent_off: whole percent, e.g. 15 for 15% off"
+        },
+        {
+          "kind": "callee",
+          "ref": "app/models/coupon.py:11",
+          "note": "CheckConstraint percent_off BETWEEN 1 AND 100"
+        },
+        {
+          "kind": "diff",
+          "ref": "tests/api/test_orders.py:68",
+          "note": "asserts only discount_cents > 0"
+        }
+      ],
+      "confidence": 0.95
+    }
+  ],
+  "skipped_files": [],
+  "warnings": [],
+  "error": null
+}

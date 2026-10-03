@@ -1,0 +1,136 @@
+"""Findings as GitLab merge request discussions plus one summary note, idempotent across runs."""
+
+import hashlib
+import json
+import logging
+import re
+from pathlib import Path
+from urllib.parse import quote
+
+import httpx
+
+from nitless.config import Settings
+from nitless.errors import ConfigError, PublishError
+from nitless.models import ChangeRequest, Finding, ReviewResult
+from nitless.output.base import OutputAdapter
+from nitless.output.markdown import render, render_finding
+from nitless.scm.gitlab import parse_mr_url
+
+log = logging.getLogger(__name__)
+
+SUMMARY_MARKER = "<!-- nitless:summary -->"
+FINGERPRINT_RE = re.compile(r"<!-- nitless:fp=([0-9a-f]{12}) -->")
+DRY_RUN_FILE = "gitlab-notes.json"
+
+
+def fingerprint(f: Finding) -> str:
+    """Same location and category → same inline comment, however the message is worded this time."""
+    return hashlib.sha1(f"{f.file}:{f.line_start}:{f.line_end}:{f.category}".encode()).hexdigest()[:12]
+
+
+class GitLabNotesAdapter(OutputAdapter):
+    """Inline discussions for findings on changed lines, the report as a summary note.
+
+    Existing notes are read first: a finding whose fingerprint is already there is skipped and the
+    summary note is updated in place. A finding GitLab cannot place (400: the line is not part of the
+    diff) is listed in the summary instead. Failed runs are never posted (`publishes_errors`).
+    """
+
+    name = "gitlab"
+    publishes_errors = False
+
+    def __init__(self, settings: Settings, transport: httpx.BaseTransport | None = None):
+        super().__init__(settings)
+        self._transport = transport  # tests pass httpx.MockTransport
+
+    def validate(self) -> None:
+        if not self.settings.mr_url:
+            raise ConfigError("the gitlab adapter needs MR_URL: it posts to a merge request, not to LOCAL_REPO")
+        if not self.settings.gitlab_token:
+            raise ConfigError("the gitlab adapter needs GITLAB_TOKEN with the api scope to post notes")
+
+    def publish(self, result: ReviewResult, change: ChangeRequest | None) -> None:
+        if change is None:
+            raise PublishError("nothing to post: the change was not resolved")
+        ref = parse_mr_url(self.settings.mr_url)  # type: ignore[arg-type]  (validate() checked)
+        token = self.settings.gitlab_token.get_secret_value()  # type: ignore[union-attr]
+        self._http = httpx.Client(base_url=f"{ref.base_url}/api/v4", headers={"PRIVATE-TOKEN": token},
+                                  timeout=30, transport=self._transport)
+        mr = f"/projects/{quote(ref.project, safe='')}/merge_requests/{ref.iid}"
+        dry_run = self.settings.gitlab_dry_run
+        planned: list[dict] = []  # dry run: the requests that were not sent
+
+        notes = self._list(f"{mr}/notes")
+        bodies = [n["body"] for n in notes]
+        bodies += [n["body"] for d in self._list(f"{mr}/discussions") for n in d.get("notes", [])]
+        present = {fp for body in bodies for fp in FINGERPRINT_RE.findall(body)}
+        summary_id = next((n["id"] for n in notes if SUMMARY_MARKER in n["body"]), None)
+
+        inline: set[str] = set()
+        skipped = outside = 0
+        for f in result.findings:
+            fp = fingerprint(f)
+            if fp in present:
+                inline.add(f.id)
+                skipped += 1
+                continue
+            payload = {"body": f"{render_finding(f)}\n\n<!-- nitless:fp={fp} -->",
+                       "position": _position(f, change)}
+            if dry_run:
+                planned.append({"method": "POST", "path": f"{mr}/discussions", "json": payload})
+                inline.add(f.id)
+            elif self._request("POST", f"{mr}/discussions", payload, tolerate=(400,)).status_code == 400:
+                outside += 1
+            else:
+                inline.add(f.id)
+
+        body = render(result, change, inline=inline).rstrip()
+        if summary_id is not None:
+            body += f"\n\n_Updated for {change.head_sha[:8]}._"
+        body += f"\n\n{SUMMARY_MARKER}"
+        method, path = ("PUT", f"{mr}/notes/{summary_id}") if summary_id is not None else ("POST", f"{mr}/notes")
+        if dry_run:
+            planned.append({"method": method, "path": path, "json": {"body": body}})
+            out = self._dry_run_path()
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(planned, indent=2, ensure_ascii=False) + "\n")
+            log.info("dry run: %d inline notes and 1 summary note written to %s, nothing posted", len(planned) - 1, out)
+            return
+        self._request(method, path, {"body": body})
+        log.info("gitlab: %d inline notes posted, %d already present, %d outside the diff listed in the summary; "
+                 "summary note %s", len(inline) - skipped, skipped, outside, "updated" if summary_id else "created")
+
+    def _dry_run_path(self) -> Path:
+        out = self.settings.output_file
+        return (out.parent if out else Path.cwd()) / DRY_RUN_FILE
+
+    def _list(self, path: str) -> list[dict]:
+        """Every page of a list endpoint."""
+        items: list[dict] = []
+        page: str | None = "1"
+        while page:
+            resp = self._request("GET", path, params={"per_page": 100, "page": page})
+            items += resp.json()
+            page = resp.headers.get("X-Next-Page") or None
+        return items
+
+    def _request(self, method: str, path: str, json: dict | None = None, *, params: dict | None = None,
+                 tolerate: tuple[int, ...] = ()) -> httpx.Response:
+        try:
+            resp = self._http.request(method, path, json=json, params=params)
+        except httpx.HTTPError as e:
+            raise PublishError(f"cannot reach GitLab for {method} {path}: {e}") from None
+        if resp.status_code in tolerate:
+            return resp
+        if resp.status_code in (401, 403):
+            raise PublishError(f"GitLab denied {method} {path} ({resp.status_code}): token lacks api scope")
+        if resp.status_code == 404:
+            raise PublishError(f"GitLab has no {path} (404): merge request or note not found")
+        if resp.is_error:
+            raise PublishError(f"GitLab API error {resp.status_code} for {method} {path}: {resp.text[:200]}")
+        return resp
+
+
+def _position(f: Finding, change: ChangeRequest) -> dict:
+    return {"position_type": "text", "base_sha": change.base_sha, "start_sha": change.start_sha,
+            "head_sha": change.head_sha, "new_path": f.file, "old_path": f.file, "new_line": f.line_start}

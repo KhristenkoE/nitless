@@ -1,0 +1,351 @@
+language: java
+description: >
+  Spring Boot 3 / Java 21 warehouse inventory service (products, per-warehouse stock levels,
+  reservations, stock movement ledger). Code-only conventions: services throw InventoryException
+  subclasses with an ErrorCode (mapped by GlobalExceptionHandler), stock changes only through
+  StockLedger.lock/record (which writes a movement row), @Transactional only on service methods,
+  constructor injection with final fields, time from the injected Clock. Documented rules live in
+  CONTRIBUTING.md (DTOs not entities from controllers, additive Flyway migrations, @WebMvcTest for
+  new endpoints). docs/adr/0001 explains why StockLevel has no @Version and relies on
+  SELECT ... FOR UPDATE row locks taken via StockLedger.
+
+cases:
+  - id: java-cycle-count-reconcile
+    kind: related-code-bug
+    context:  # what a reviewer must see to judge the case (eval.context_check)
+      - {file: src/main/java/com/acme/inventory/service/StockLedger.java, lines: [17, 20]}  # callers hold lock()
+      - {file: src/main/java/com/acme/inventory/repository/StockLevelRepository.java, lines: [14, 15]}
+      - {file: src/main/java/com/acme/inventory/service/StockService.java, lines: [42, 42]}  # adjust() locks first
+      - docs/adr/0001-stock-level-concurrency.md
+    title: "INV-214: Reconcile stock levels with cycle counts"
+    description: |
+      Warehouse teams run cycle counts every night and currently fix discrepancies by hand via the
+      adjustments endpoint, computing the delta themselves. This adds
+      `POST /api/v1/products/{id}/stock/counts`: the client sends the counted quantity and we book
+      the difference as an ADJUSTMENT with reference `cycle-count:<countId>`, so it shows up in the
+      movement history like any other correction. A count that matches books nothing.
+
+      - `StockService.reconcileCount` + `CycleCountRequest`
+      - unit tests for the service and a `@WebMvcTest` for the endpoint
+    task:
+      id: INV-214
+      title: Reconcile stock levels with cycle counts
+      intent: >
+        Let the warehouse scanner app submit physical count results so the system corrects the
+        on-hand quantity itself instead of staff calculating adjustment deltas by hand.
+      acceptance_criteria:
+        - "POST /api/v1/products/{productId}/stock/counts accepts warehouseCode, countedQuantity (>= 0) and countId."
+        - "The difference between the counted and the current on-hand quantity is booked as an ADJUSTMENT movement with reference cycle-count:<countId>."
+        - "When the count matches the current on-hand quantity, no movement is booked."
+        - "Returns the resulting stock level; 404 STOCK_LEVEL_NOT_FOUND if the product has no stock in that warehouse."
+        - "Endpoint is covered by a @WebMvcTest."
+      out_of_scope:
+        - "Scheduling or assigning cycle counts to staff."
+    expected:
+      - file: src/main/java/com/acme/inventory/service/StockService.java
+        lines: [53, 57]
+        what: >
+          reconcileCount reads the stock level with the non-locking findByProductIdAndWarehouseCode
+          instead of StockLedger.lock (SELECT ... FOR UPDATE), computes the delta from that unlocked
+          snapshot and then modifies the row. StockLevel has no @Version (ADR 0001), so a concurrent
+          reservation/receipt/shipment between the read and commit is silently lost or the delta is
+          computed from a stale on-hand value.
+        categories: [correctness, reliability, convention]
+        min_severity: major
+    notes: >
+      Every other write path in StockService/ReservationService calls ledger.lock(...) first; the
+      new method uses the read-only finder whose Javadoc says it is for queries that do not modify
+      the stock level. The diff looks tidy and even goes through ledger.record, so the bug is only
+      visible by knowing that record() assumes the caller holds the row lock and that ADR 0001
+      removed optimistic locking. Tests mock the finder, cementing the bug.
+
+  - id: java-unreserved-shipments
+    kind: related-code-bug
+    context:  # what a reviewer must see to judge the case (eval.context_check)
+      - {file: src/main/java/com/acme/inventory/service/StockLedger.java, lines: [46, 57]}  # record() applies the sign
+      - {file: src/main/java/com/acme/inventory/domain/MovementType.java, lines: [11, 17]}  # SHIPMENT(-1, 0)
+    title: "INV-221: Record shipments that bypass reservations"
+    description: |
+      B2B pallet orders are picked directly by the warehouse team and never go through the
+      reservation flow, so today their stock leaves the building without being booked. This adds
+      `POST /api/v1/products/{id}/stock/shipments` which books a SHIPMENT movement against the
+      locked stock level. Shipping reserved stock is rejected by the ledger with 409
+      INSUFFICIENT_STOCK, same as for adjustments.
+    expected:
+      - file: src/main/java/com/acme/inventory/service/StockService.java
+        lines: [54, 54]
+        what: >
+          ship() passes -quantity to ledger.record with MovementType.SHIPMENT, but the ledger
+          already applies SHIPMENT's onHandSign of -1 (only ADJUSTMENT takes a signed delta), so a
+          shipment of 40 units increases on-hand stock by 40 instead of decreasing it, and the
+          insufficient-stock check never triggers.
+        categories: [correctness]
+        min_severity: major
+    notes: >
+      The minus sign looks natural next to the adjust() method just above, which passes a signed
+      delta. Whether it is wrong depends on MovementType (SHIPMENT(-1, 0)) and the Javadoc of
+      StockLedger.record, both outside the diff. The service test verifies record(..., -40, ...)
+      and the controller test mocks the service, so the tests pass and look convincing.
+
+  - id: java-discontinue-product
+    kind: code-convention
+    context:  # what a reviewer must see to judge the case (eval.context_check)
+      - {file: src/main/java/com/acme/inventory/service/StockLedger.java, lines: [53, 68]}  # the only writer of stock levels
+    title: "INV-198: Discontinue products"
+    description: |
+      Category managers need to take products out of the assortment. New endpoint
+      `POST /api/v1/products/{id}/discontinue`:
+
+      - sets the product status to DISCONTINUED (idempotent)
+      - writes off unreserved stock in every warehouse so it cannot be reserved any more;
+        units held by open reservations stay so those orders can still be shipped
+
+      Blocking new receipts for discontinued products will follow in INV-199.
+    expected:
+      - file: src/main/java/com/acme/inventory/service/ProductService.java
+        lines: [61, 64]
+        what: >
+          Stock levels are loaded with the non-locking findByProductIdOrderByWarehouseCode and then
+          modified in place, without the FOR UPDATE lock (StockLedger.lock / lockOrCreate) every other
+          stock write takes, so a concurrent reservation can be lost.
+        categories: [convention, correctness, reliability]
+        min_severity: major
+      - file: src/main/java/com/acme/inventory/service/ProductService.java
+        lines: [61, 64]
+        what: >
+          The write-off calls level.setQuantity/setUpdatedAt directly instead of StockLedger.record, so
+          no StockMovement row is written for the removed units and the movement history no longer adds
+          up to the stock levels; it should record an ADJUSTMENT of -available.
+        categories: [convention, correctness, reliability]
+    notes: >
+      Convention exists only in code: every stock change goes through StockLedger.record (which is
+      the only caller of StockLevel.setQuantity in main code), which locks the row and writes a movement
+      row. Those are two defects with two fixes (locking alone records nothing; recording alone does not
+      lock), and Opus reports them as two findings, so they are two expected findings. The setters are
+      public, so nothing stops this; the MR otherwise follows all conventions (Clock, constructor
+      injection, InventoryException, DTO, @WebMvcTest).
+
+  - id: java-extend-reservation
+    kind: code-convention
+    context:  # what a reviewer must see to judge the case (eval.context_check)
+      - {file: src/main/java/com/acme/inventory/service/StockLedger.java, lines: [34, 38]}  # lock()
+      - {file: src/main/java/com/acme/inventory/api/GlobalExceptionHandler.java, lines: [12, 19]}
+    title: "INV-230: Allow extending active reservations"
+    description: |
+      Checkout keeps reservations alive while the payment provider retries a declined charge,
+      which can take longer than the 30 minute TTL. This adds
+      `POST /api/v1/reservations/{id}/extend` with `{"minutes": 1..120}`. The expiry is pushed back
+      from the current expiry, or from now if the reservation is already overdue but the expiry job
+      has not processed it yet. Closed reservations are rejected with 409.
+    expected:
+      - file: src/main/java/com/acme/inventory/service/ReservationService.java
+        lines: [84, 87]
+        what: >
+          The service throws Spring's ResponseStatusException(HttpStatus.CONFLICT) instead of an
+          InventoryException subclass (ReservationStateException already exists for exactly this),
+          so the service layer depends on web types and the error bypasses GlobalExceptionHandler:
+          clients get Spring's default error body without the INVALID_RESERVATION_STATE code.
+        categories: [convention, api-contract]
+    notes: >
+      Code-only convention: services never throw ResponseStatusException; all domain errors are
+      InventoryException subclasses with an ErrorCode mapped by the @RestControllerAdvice. The
+      controller test only asserts the 409 status, so it passes. Everything else (Clock, lock
+      like sibling methods, DTO, validation) is consistent with the codebase.
+
+  - id: java-reservations-by-order
+    kind: doc-convention
+    title: "INV-236: List reservations of an order"
+    description: |
+      The order service needs to show which items of an order are still held and which expired.
+      Adds `GET /api/v1/reservations?orderReference=...` returning all reservations of the order,
+      in every status, oldest first. Backed by the existing `order_reference` index (V5).
+    expected:
+      - file: src/main/java/com/acme/inventory/api/ReservationController.java
+        lines: [36, 39]
+        what: >
+          The new endpoint returns List<Reservation> JPA entities directly instead of mapping to the
+          ReservationResponse DTO record, violating the CONTRIBUTING.md rule that controllers never
+          return entities (exposes internal columns like createdAt/updatedAt and couples the API to
+          the persistence model).
+        categories: [convention, api-contract]
+    notes: >
+      Rule is written in CONTRIBUTING.md ("Never return JPA entities from a controller"). The
+      DTO ReservationResponse.from already exists and is used by every sibling method, so the fix
+      is a one-line map. Tests pass because the entity serialises to similar JSON.
+
+  - id: java-movement-history
+    kind: missing-ac
+    title: "INV-240: Stock movement history endpoint"
+    description: |
+      Support currently needs DB access to explain why a stock level changed. This exposes the
+      ledger read-only:
+
+      - `GET /api/v1/products/{id}/movements`, newest first, paginated (`page`, `size`, default
+        50, capped at 200)
+      - optional `warehouse` filter
+      - `MovementResponse` DTO with type, quantity, on-hand/reserved after the movement,
+        reference and timestamp
+
+      Story is in `story.json`.
+    task_in_repo: true
+    task:
+      id: INV-240
+      title: Stock movement history endpoint
+      intent: >
+        Let support and warehouse leads see every change to a product's stock without database
+        access.
+      acceptance_criteria:
+        - "GET /api/v1/products/{productId}/movements returns the product's stock movements, newest first."
+        - "An optional warehouse query parameter restricts the result to one warehouse."
+        - "The result is paginated with page and size; size defaults to 50 and is capped at 200."
+        - "Each item contains id, warehouseCode, type, quantity, onHandAfter, reservedAfter, reference and occurredAt."
+        - "Responds 404 PRODUCT_NOT_FOUND when the product does not exist (not an empty page)."
+        - "The endpoint is covered by a @WebMvcTest."
+      out_of_scope:
+        - "CSV export of the history."
+        - "Filtering by movement type or date range."
+    expected:
+      - file: src/main/java/com/acme/inventory/service/MovementHistoryService.java
+        lines: [25, 31]
+        what: >
+          The history lookup never checks that the product exists, so an unknown product id returns
+          200 with an empty page instead of 404 PRODUCT_NOT_FOUND as required by the acceptance
+          criteria (StockService.getStock does this via requireProduct/ProductNotFoundException).
+        categories: [requirements, correctness, api-contract]
+    notes: >
+      Five of six ACs are implemented and tested (ordering, filter, cap, fields, @WebMvcTest).
+      The missing one is explicit in the story ("not an empty page"), which is committed in the
+      repo as story.json rather than passed to the reviewer.
+
+  - id: java-partial-release
+    kind: diff-bug
+    context:  # what a reviewer must see to judge the case (eval.context_check)
+      - {file: src/main/java/com/acme/inventory/service/StockLedger.java, lines: [34, 38]}  # lock()
+      - {file: src/main/java/com/acme/inventory/service/StockLedger.java, lines: [53, 68]}  # record()
+    title: "INV-244: Partial release of reservations"
+    description: |
+      When a customer removes items from an open order, checkout currently releases the whole
+      reservation and reserves again, which can fail if someone else grabbed the stock in between.
+      New endpoint `POST /api/v1/reservations/{id}/partial-release` with `{"quantity": n}` gives
+      back part of the reserved quantity; the reservation stays ACTIVE with the remainder.
+      Releasing everything still goes through `/release`.
+    expected:
+      - file: src/main/java/com/acme/inventory/service/ReservationService.java
+        lines: [68, 69]
+        what: >
+          After reservation.releasePartially(quantity) reduced the reservation, the ledger RELEASE
+          is recorded with reservation.getQuantity() (the remaining amount) instead of the released
+          quantity, so the stock level's reserved count drops by the wrong amount (e.g. reserve 5,
+          release 2 -> reserved drops by 3), desynchronising reserved stock from reservations.
+        categories: [correctness]
+        min_severity: major
+    notes: >
+      Sanity check: the wrong argument is visible in two adjacent lines of the diff (the method
+      parameter `quantity` is used for the entity but not for the ledger). Copy-paste from
+      release() makes it look familiar. The controller test mocks the service.
+
+  - id: java-warehouse-transfer
+    kind: correct-here
+    context:  # what a reviewer must see to judge the case (eval.context_check)
+      - {file: src/main/java/com/acme/inventory/service/StockLedger.java, lines: [53, 62]}  # rejects on-hand < reserved
+      - docs/adr/0001-stock-level-concurrency.md
+    title: "INV-252: Inter-warehouse stock transfers"
+    description: |
+      Rebalancing stock between warehouses is currently done as a negative adjustment in one
+      warehouse and a receipt in the other, in two requests, which leaves stock "in limbo" if the
+      second call fails. This adds `POST /api/v1/products/{id}/stock/transfers` that books both
+      sides in one transaction (`transfer-out:<ref>` / `transfer-in:<ref>`). The target stock level
+      is created if the product was never stocked there.
+    forbidden:
+      - file: src/main/java/com/acme/inventory/service/StockService.java
+        lines: [61, 70]
+        what: >
+          Locking both stock levels in warehouse-code order, relying on the ledger's
+          insufficient-stock check, no @Version/optimistic locking and no explicit save() of the
+          modified entities are all correct here per ADR 0001 and StockLedger.record.
+    notes: >
+      Trap. A naive reviewer flags (a) check-then-act race / missing optimistic locking, (b) no
+      save() after modifying the entities, (c) no available-quantity check before shipping out, or
+      (d) the odd if/else lock ordering. ADR 0001 explicitly says: no @Version by design, writers
+      hold FOR UPDATE locks via StockLedger.lock/lockOrCreate, dirty checking flushes locked rows,
+      and multiple levels are locked in warehouse-code order to avoid deadlocks. StockLedger.record
+      rejects a SHIPMENT that would push on-hand below reserved.
+
+  - id: java-low-stock-report
+    kind: out-of-scope
+    title: "INV-260: Low-stock report per warehouse"
+    description: |
+      Replenishment currently exports stock levels to a spreadsheet to find what to reorder. This
+      adds `GET /api/v1/warehouses/{code}/low-stock` listing every product whose available
+      quantity (on hand minus reserved) is below a threshold, lowest first. The threshold defaults
+      to `inventory.low-stock-threshold` (10) and can be overridden with `?threshold=`.
+    task:
+      id: INV-260
+      title: Low-stock report per warehouse
+      intent: >
+        Give the replenishment script a single call that returns everything in a warehouse that
+        needs reordering.
+      acceptance_criteria:
+        - "GET /api/v1/warehouses/{warehouseCode}/low-stock returns stock levels whose available quantity (on hand minus reserved) is below the threshold."
+        - "The threshold defaults to the inventory.low-stock-threshold setting and can be overridden with ?threshold=."
+        - "Results are sorted by available quantity, lowest first."
+        - "The endpoint is covered by a @WebMvcTest."
+      out_of_scope:
+        - "Pagination: a warehouse holds at most a few thousand SKUs and the replenishment script needs the complete list in one response."
+        - "Alerts or notifications when stock drops below the threshold."
+        - "Per-product thresholds."
+    forbidden:
+      - file: src/main/java/com/acme/inventory/repository/StockLevelRepository.java
+        lines: [25, 31]
+        what: "Returning an unpaginated List is intended; pagination is explicitly out of scope."
+      - file: src/main/java/com/acme/inventory/api/WarehouseController.java
+        lines: [22, 30]
+        what: "Unpaginated List response and a single global threshold are explicitly out of scope."
+    notes: >
+      Trap. The rest of the API paginates list endpoints (products, movements), so a reviewer is
+      tempted to demand pagination or per-product thresholds; the task explicitly rules both out.
+      The implementation otherwise satisfies every acceptance criterion.
+
+  - id: java-product-by-sku
+    kind: clean
+    title: "INV-205: Look up products by SKU"
+    description: |
+      The scanner app only knows the SKU printed on the label, and currently has to page through
+      `/products` to find the id. Adds `GET /api/v1/products/by-sku/{sku}` (404 PRODUCT_NOT_FOUND
+      when unknown), backed by the existing unique index on `products.sku`.
+    notes: >
+      Trap. Small, complete feature that follows every convention: InventoryException subclass
+      with ErrorCode, read-only @Transactional on the service, DTO response, @WebMvcTest plus a
+      unit test. Expect no findings.
+
+  - id: java-expiry-job-summary
+    kind: nit-bait
+    title: "INV-263: Log a summary per reservation expiry run"
+    description: |
+      On-call could not tell from the logs whether the expiry job was keeping up during the
+      last sale. The job now logs one line per run with how many reservations were expired and
+      how many failed, and a hint when the batch was full (more reservations are waiting). Runs
+      with nothing due stay silent.
+    forbidden:
+      - file: src/main/java/com/acme/inventory/service/ReservationExpiryJob.java
+        lines: [34, 49]
+        what: >
+          Only cosmetic issues: abbreviated counter name `cnt`, a comment that restates the code,
+          lower-case log message inconsistent with the other messages.
+    notes: >
+      Trap. Behaviour is correct (counts, early return, full-batch hint) and a test covers the
+      empty case. The only imperfections are naming/comment/log-casing nits that a good reviewer
+      should not report.
+
+  - id: java-big-mr
+    kind: composed
+    compose: [java-unreserved-shipments, java-discontinue-product, java-partial-release, java-expiry-job-summary]
+    title: "Release 0.10: shipments, discontinued products, partial release, expiry job summary"
+    description: |
+      Release branch for 0.10, merged as one MR because the features ship together. Besides the tickets
+      below it adds the Apache-2.0 license (LICENSE and a header in the source files that existed before this release; files new in this release get theirs with the header check that lands next release) and the generated
+      API reference (docs/reference.md) and test inventory (docs/test-inventory.md), plus unit tests for the stock ledger, stock levels, the exception
+      handler, DTOs and request validation, exceptions and movement types.
+    notes: >
+      Large-MR case: four cases' changes in one diff plus ~35 files of filler (cases/java-big-mr: license
+      headers, a generated reference page and a version bump), which must stay silent.

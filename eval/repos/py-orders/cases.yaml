@@ -1,0 +1,332 @@
+language: python
+description: >
+  FastAPI + SQLAlchemy orders/billing service (orders, payments, refunds, coupons,
+  transactional outbox + webhook relay). Code-only conventions: integer cents and
+  basis points via app/core/money.py, services raise app/core/errors.py domain errors
+  (never HTTPException), time via app.core.clock.utcnow(), repositories flush but never
+  commit, structlog `log.info("event_name", key=value)`. Documented rules live in
+  README.md / CONTRIBUTING.md; docs/adr/0001 justifies the blind except in the notifier.
+
+cases:
+  - id: py-coupon-checkout
+    kind: related-code-bug
+    context:  # what a reviewer must see to judge the case (eval.context_check)
+      - {file: app/core/money.py, lines: [10, 16]}  # percent_of takes basis points
+      - {file: app/models/coupon.py, lines: [11, 15]}  # percent_off is a whole percent
+    title: "ORD-231: apply coupon codes at checkout"
+    description: |
+      Coupons can already be created from the back office (`POST /admin/coupons`), this wires them
+      into checkout.
+
+      - `OrderCreate` accepts an optional `coupon_code` (case-insensitive, same as the admin side)
+      - unknown code -> 404, inactive/expired code -> 409
+      - the discount is applied to the item subtotal before tax, and the coupon is linked to the order
+      - `order.created` outbox payload now carries `discount_cents` and `coupon_id` for CRM
+    expected:
+      - file: app/services/orders.py
+        lines: [57, 59]
+        what: >
+          percent_of() takes basis points (10_000 = 100%) but coupon.percent_off is a whole percent
+          (1..100, see Coupon check constraint and CouponCreate), so a 15% coupon only takes 0.15% off;
+          it must be converted (percent_off * 100) before calling percent_of.
+        categories: [correctness]
+        min_severity: major
+    notes: >
+      The diff reads naturally: `percent_of(subtotal_cents, coupon.percent_off)`. Only by opening
+      app/core/money.py (percent_of(amount_cents, basis_points), BPS_DENOMINATOR = 10_000) and the
+      Coupon model / CouponCreate schema (percent_off is 1..100, "15 for 15% off") does the 100x
+      under-discount appear. The MR's test only asserts discount_cents > 0, which passes with 8 cents.
+
+  - id: py-add-order-items
+    kind: related-code-bug
+    context:  # what a reviewer must see to judge the case (eval.context_check)
+      - {file: app/models/order.py, lines: [41, 46]}  # UniqueConstraint(order_id, product_id)
+    title: "ORD-274: allow adding items to a pending order"
+    description: |
+      Customers asked to be able to add something to an order they haven't paid for yet instead of
+      creating a second order.
+
+      Adds `POST /orders/{order_id}/items` taking the same `{product_id, quantity}` body as checkout.
+      Only pending orders can be changed; totals are recomputed and an `order.updated` event is
+      emitted so the warehouse preview stays in sync. Same ownership rules as `GET /orders/{id}`.
+    expected:
+      - file: app/services/orders.py
+        lines: [86, 93]
+        what: >
+          add_item always appends a new OrderItem, but order_items has a UniqueConstraint on
+          (order_id, product_id); adding a product that is already on the order raises an IntegrityError
+          (500) instead of increasing the existing line's quantity (or returning a 409).
+        categories: [correctness, reliability]
+        min_severity: major
+    notes: >
+      The constraint lives in app/models/order.py (UniqueConstraint("order_id", "product_id")) and is
+      mirrored by the OrderCreate validator in app/schemas/order.py ("each product may appear only once
+      per order; adjust the quantity instead"), both outside the diff. Checkout never hits it because the
+      schema rejects duplicates up front; the new endpoint bypasses that validator. Tests only add a
+      new product, so they pass.
+
+  - id: py-revenue-report
+    kind: code-convention
+    context:  # what a reviewer must see to judge the case (eval.context_check)
+      - # any sibling schema showing money as integer *_cents fields
+        - {file: app/schemas/order.py, lines: [25, 49]}
+        - {file: app/schemas/product.py, lines: [5, 21]}
+        - {file: app/schemas/payment.py, lines: [15, 37]}
+    title: "ORD-289: revenue summary report for finance"
+    description: |
+      Finance wants a quick number for the weekly sync without going through the data warehouse.
+
+      `GET /admin/reports/revenue?start=YYYY-MM-DD&end=YYYY-MM-DD` returns order count, gross revenue and
+      average order value for orders paid in the (inclusive, UTC) date range. Refunded orders are
+      excluded. Admin only (lives on the admin router).
+    expected:
+      - file: app/services/orders.py
+        lines: [94, 95]
+        what: >
+          Money is converted to float dollars (revenue_cents / 100, rounded average) and exposed as float
+          fields in RevenueSummary; everywhere else the service keeps money as integer *_cents values,
+          so this should return gross_revenue_cents / average_order_value_cents as ints.
+        also_at:
+          - file: app/schemas/report.py
+            lines: [11, 12]
+        categories: [convention, correctness, api-contract]
+      - file: app/repositories/orders.py
+        lines: [32, 36]
+        what: >
+          revenue_between sums Order.total_cents over orders in every currency (currency is a per-order
+          column) and the service labels the total with settings.default_currency, so a mixed-currency
+          shop gets a meaningless number; the total must be per currency or the query restricted to one.
+        also_at:
+          - file: app/services/orders.py
+            lines: [92, 100]
+        categories: [correctness]
+    notes: >
+      No doc says "never use floats for money"; the convention is only visible from every model, schema,
+      pricing function and money helper using integer *_cents. The cross-currency sum was added as a second
+      expected finding after Opus flagged it in every run: Order.currency is per row, so it is a real bug.
+      The rest of the MR is clean: auth comes from the router-level require_admin, dates are tz-aware
+      without datetime.now(), a test exists.
+
+  - id: py-pending-order-limit
+    kind: code-convention
+    context:  # what a reviewer must see to judge the case (eval.context_check)
+      - app/core/errors.py  # services raise DomainError subclasses
+      - {file: app/main.py, lines: [17, 24]}  # DomainError -> error envelope
+    title: "ORD-296: cap unpaid orders per customer"
+    description: |
+      We are seeing bots create hundreds of pending orders to probe prices and coupon codes. This caps
+      the number of unpaid (pending) orders a customer can hold at once; the limit is configurable via
+      `ORDERS_MAX_PENDING_ORDERS_PER_CUSTOMER` (default 5). Paid/shipped orders don't count.
+    expected:
+      - file: app/services/orders.py
+        lines: [28, 33]
+        what: >
+          The service raises fastapi.HTTPException; services must raise domain errors from
+          app/core/errors.py (ConflictError here) so the global handler produces the standard
+          {"error": {code, message, details}} body — this returns {"detail": ...} instead and couples the
+          service layer to FastAPI.
+        categories: [convention, api-contract]
+    # The count-then-insert race is real (not planted); a reviewer flagging it is right.
+    max_findings: 2
+    notes: >
+      The HTTPException is well-formed and returns the "right" status code, and the test even asserts on
+      response.json()["detail"]. Only knowing that no service imports fastapi and that app/main.py maps
+      DomainError subclasses to a uniform error envelope reveals the violation. Not documented anywhere.
+
+  - id: py-product-by-sku
+    kind: doc-convention
+    title: "ORD-301: look up products by SKU"
+    description: |
+      The storefront is moving to SKU-based product URLs (`/p/MUG-001`), so it needs to resolve a product
+      by SKU instead of internal id.
+
+      Adds `GET /products/by-sku/{sku}` (case-insensitive, inactive products are hidden, same as by id).
+    expected:
+      - file: app/api/products.py
+        lines: [23, 25]
+        what: >
+          New endpoint GET /products/by-sku/{sku} has no test in tests/api, which CONTRIBUTING.md requires
+          for every new endpoint (happy path + one error path).
+        categories: [test-coverage, convention]
+    notes: >
+      The code itself is fine (schema response_model, domain NotFoundError, repository without commit,
+      route declared before /{product_id}). The only problem is the missing API test, which is a written
+      rule in CONTRIBUTING.md. A reviewer has to notice the absence of a file in the diff.
+
+  - id: py-order-cancellation
+    kind: missing-ac
+    title: "ORD-318: let customers cancel unpaid orders"
+    description: |
+      Adds `POST /orders/{order_id}/cancel` for pending orders, see story ORD-318.
+      Paid orders are out of scope (they need the refund flow).
+    task_in_repo: true
+    task:
+      id: ORD-318
+      title: Let customers cancel unpaid orders
+      intent: >
+        Customers regularly contact support to cancel an order they have not paid for yet. They should be
+        able to do it themselves, and downstream systems (warehouse picking, CRM emails) must learn about
+        the cancellation.
+      acceptance_criteria:
+        - "`POST /orders/{order_id}/cancel` cancels a pending order owned by the caller and returns the order with status `cancelled`."
+        - Cancelling an order that is not pending returns 409 with error code `conflict`.
+        - Cancelling another customer's order returns 404, exactly like reading it.
+        - An `order.cancelled` event with the order id and customer id is written to the outbox in the same transaction.
+        - API tests cover the happy path and both error cases.
+      out_of_scope:
+        - Cancelling paid or shipped orders (requires the refund flow, ORD-322).
+        - Returning stock to inventory.
+    expected:
+      - file: app/services/orders.py
+        lines: [71, 79]
+        what: >
+          cancel_order changes the status but never writes the required `order.cancelled` outbox event
+          (OutboxRepository.add), so the warehouse/CRM are never notified — acceptance criterion 4 is
+          not implemented.
+        categories: [requirements]
+        min_severity: major
+    notes: >
+      Four of five ACs are implemented and tested; the method is otherwise correct and mirrors
+      mark_shipped, which does emit an event. Spotting it requires checking every AC against the diff.
+      The story is committed as story.json.
+
+  - id: py-partial-refunds
+    kind: diff-bug
+    title: "ORD-340: support partial refunds"
+    description: |
+      Support can now refund part of a payment (e.g. one damaged item) instead of the whole amount.
+
+      - `RefundCreate.amount_cents` is optional; omitted = refund the remaining balance (old behaviour)
+      - payment stays `captured` until it is fully refunded; the order only moves to `refunded` then
+      - `payment.refunded` event now includes `fully_refunded`
+    task:
+      id: ORD-340
+      title: Partial refunds
+      intent: Allow support to refund only part of a captured payment.
+      acceptance_criteria:
+        - The refund request accepts an optional positive `amount_cents`; when omitted the remaining refundable balance is refunded.
+        - An amount larger than the remaining refundable balance is rejected with 409 and the gateway is not called.
+        - A payment stays `captured` while partially refunded and becomes `refunded` once fully refunded; the order becomes `refunded` only on full refund.
+        - The `payment.refunded` outbox event includes the refunded amount and whether the payment is now fully refunded.
+      out_of_scope:
+        - Refunding specific order items or restocking them.
+    expected:
+      - file: app/services/payments.py
+        lines: [78, 81]
+        what: >
+          The guard is inverted: `if amount < refundable` rejects every partial refund and lets amounts
+          larger than the refundable balance through (over-refund); it must be `amount > refundable`.
+        categories: [correctness]
+        min_severity: critical
+    notes: >
+      Sanity-check case: the inverted comparison is visible in the diff next to its own error message
+      ("refund exceeds the refundable balance"). Tests only exercise full-amount refunds, so they pass.
+
+  - id: py-webhook-signing
+    kind: correct-here
+    context:  # what a reviewer must see to judge the case (eval.context_check)
+      - docs/adr/0001-webhook-delivery-via-outbox.md
+      - {file: app/services/outbox_relay.py, lines: [24, 40]}  # False -> retry / dead-letter
+    title: "ORD-352: sign outgoing webhooks"
+    description: |
+      CRM asked us to sign webhooks so they can verify they come from us.
+
+      - new optional setting `ORDERS_WEBHOOK_SIGNING_SECRET`; when set, every delivery carries
+        `X-Orders-Signature: t=<unix ts>,v1=<hex hmac-sha256("<ts>.<body>")>` (same scheme as our
+        payment provider, so receivers can reuse their verification code)
+      - the body is now serialized once, compactly and with sorted keys, so the signature is computed over
+        exactly the bytes we send
+      - serialization/signing happen inside the delivery attempt, so a broken payload counts as a failed
+        attempt and follows the normal retry/dead-letter path
+      - failure log now includes the attempt number
+
+      Rollout: secret gets configured per environment first, receivers start verifying afterwards.
+    forbidden:
+      - file: app/services/notifier.py
+        lines: [44, 52]
+        what: >
+          Broad `except Exception` that logs a warning and returns False instead of raising. This is the
+          documented design (ADR-0001: the notifier never raises; the outbox relay retries and dead-letters).
+    notes: >
+      Trap: a naive reviewer flags the blind except / swallowed exception (and maybe asks to re-raise or
+      narrow it to httpx.HTTPError). docs/adr/0001-webhook-delivery-via-outbox.md explicitly requires the
+      notifier to catch everything, including serialization errors, and return False; relay_pending turns
+      False into retries and `outbox_event_dead`. Signing itself is correct (hmac over "<ts>.<body>",
+      clock.utcnow(), no secret default).
+
+  - id: py-stock-reservation
+    kind: out-of-scope
+    title: "ORD-305: reserve stock at checkout"
+    description: |
+      We oversold the spring mug drop twice. Checkout now checks and decrements `stock_quantity`.
+
+      - product rows are locked (`SELECT ... FOR UPDATE`, in id order) while the order is placed
+      - insufficient stock -> 409 with requested/available in the error details; nothing is reserved
+      - releasing stock is ORD-306 (see story)
+    task:
+      id: ORD-305
+      title: Reserve stock at checkout
+      intent: Prevent overselling by reserving inventory when an order is placed.
+      acceptance_criteria:
+        - Placing an order decrements each product's `stock_quantity` by the ordered quantity.
+        - If any product lacks stock the order is rejected with 409 including the product id, requested and available quantities, and no stock changes.
+        - Product rows are locked while stock is checked so that concurrent checkouts cannot oversell.
+      out_of_scope:
+        - Returning stock to inventory when an order is cancelled, refunded or never paid (ORD-306, together with the warehouse sync).
+        - Showing availability in the product listing.
+    forbidden:
+      - file: app/services/orders.py
+        lines: [43, 50]
+        what: >
+          Stock is decremented at checkout but never released on cancellation/refund/abandonment. This is
+          explicitly out of scope for ORD-305 (handled by ORD-306).
+    notes: >
+      Trap: the obvious "but stock is never given back" comment is explicitly listed as out of scope.
+      The implementation itself is correct: rows locked in a deterministic order, the request transaction
+      rolls back on the 409 so partial decrements never persist, stock can't go negative.
+
+  - id: py-order-status-filter
+    kind: clean
+    title: "ORD-311: filter order history by status"
+    description: |
+      The account page wants tabs for "open" and "completed" orders. `GET /orders` accepts an optional
+      `status` query parameter (one of the order statuses); unknown values are rejected with 422.
+    notes: >
+      Small, conventional change through all layers (router -> service -> repository), keeps pagination,
+      typed enum query param with alias to avoid shadowing fastapi.status, tests for filter and invalid
+      value. Expect silence.
+
+  - id: py-readiness-probe
+    kind: nit-bait
+    context:  # what a reviewer must see to judge the case (eval.context_check)
+      - {file: tests/conftest.py, lines: [63, 73]}  # client fixture clears dependency_overrides
+    title: "OPS-88: add readiness probe"
+    description: |
+      Kubernetes currently only has a liveness probe, so pods receive traffic before the DB pool is up and
+      during DB failovers. Adds `GET /health/ready` which runs `SELECT 1` and returns 503 when the database
+      is unreachable.
+    forbidden:
+      - file: app/api/health.py
+        lines: [20, 25]
+        what: >
+          Cosmetic only: one-letter connection variable `c`, a vague `# check the db` comment and a stray
+          blank line.
+    notes: >
+      Correct and tested change (schema response, logs via get_logger, 503 on SQLAlchemyError, engine via
+      dependency so tests override it). The only imperfections are cosmetic; a good reviewer stays quiet.
+
+  - id: py-big-mr
+    kind: composed
+    compose: [py-coupon-checkout, py-product-by-sku, py-partial-refunds, py-webhook-signing, py-readiness-probe]
+    title: "Release 0.15: coupons at checkout, partial refunds, signed webhooks, readiness probe"
+    description: |
+      Release branch for 0.15, merged as one MR because the features ship together. Besides the tickets
+      below it adds the Apache-2.0 license (LICENSE and a header in the source files that existed before this release; files new in this release get theirs with the header check that lands next release), the generated API
+      reference (docs/reference.md) and test inventory (docs/test-inventory.md), `-> None` annotations on test functions for mypy, and two renames:
+      `relay_pending` -> `relay_pending_events` and `configure_logging` -> `setup_logging`. It also adds tests for
+      auth, coupons, the outbox relay schedule and the model column types.
+    notes: >
+      Large-MR case: five cases' changes in one diff (~40 files of filler), so the reviewer has to find the
+      planted issues among many unrelated, behaviour-preserving changes. The filler (cases/py-big-mr) is
+      license headers, a generated reference page, return annotations, a version bump and two mechanical
+      renames: it must stay silent.

@@ -1,0 +1,319 @@
+language: typescript
+description: >
+  Room/appointment bookings monorepo-lite: Express 5 + zod + pg API in server/
+  (routes -> controllers -> services -> repositories) and a React 18 + TanStack Query
+  client in web/. Code-only conventions: services return Result<T, AppError> and
+  controllers unwrap it with sendResult; all time handling through server/src/lib/time.ts;
+  SQL only in repositories via the `sql` tag; web data fetching only through hooks in
+  web/src/api using apiClient (which unwraps the `{ data }` envelope); logger.child({ module }).
+  Documented rules (CONTRIBUTING.md / AGENTS.md): zod-validated bodies and queries,
+  list keys from data never index, flags via flags.isEnabled(), append-only migrations,
+  fire-and-forget `void audit.record(...)`.
+
+cases:
+  - id: ts-room-bookings-pagination
+    kind: related-code-bug
+    context:  # what a reviewer must see to judge the case (eval.context_check)
+      - {file: server/src/services/roomService.ts, lines: [36, 51]}  # archiveRoom needs all rows
+      - {file: server/src/services/availabilityService.ts, lines: [12, 20]}
+    title: Paginate the room bookings endpoint
+    description: |
+      Staff tooling pulls `GET /api/rooms/:roomId/bookings` for long ranges and some rooms
+      now return thousands of rows. This adds `page` / `pageSize` query parameters
+      (defaults 1 / 50, max 200) and exposes the total via an `X-Total-Count` header so the
+      response body stays a plain array.
+
+      - `roomBookingsQuery` schema extends `rangeQuery`
+      - `bookingRepository.listForRoom` takes a page, new `countForRoom`
+      - stable ordering (`starts_at, id`) so pages don't shuffle
+    task:
+      id: BK-287
+      title: Paginate GET /rooms/:roomId/bookings
+      intent: The staff schedule endpoint returns unbounded result sets for long ranges.
+      acceptance_criteria:
+        - The endpoint accepts `page` (default 1) and `pageSize` (default 50, max 200).
+        - The total number of matching bookings is returned in an `X-Total-Count` header.
+        - The response body shape (array of bookings) does not change.
+      out_of_scope:
+        - Cursor-based pagination.
+    expected:
+      - file: server/src/repositories/bookingRepository.ts
+        lines: [46, 50]
+        what: >
+          listForRoom now defaults to LIMIT 50, but other callers that are not in the diff
+          rely on it returning every booking: roomService.archiveRoom lists all upcoming
+          bookings (from now to END_OF_TIME) to cancel them, so archiving a room with more
+          than 50 upcoming bookings leaves the rest confirmed on an inactive room
+          (availabilityService.getFreeSlots also calls it without a page).
+        categories: [correctness, api-contract, reliability]
+        min_severity: major
+    notes: >
+      The pagination itself is clean and follows every convention. The defect is that the
+      default LIMIT was pushed into a shared repository function whose other callers
+      (roomService.archiveRoom, availabilityService.getFreeSlots) are outside the diff and
+      silently depend on "all rows". Only visible after searching for listForRoom callers;
+      archiveRoom is where it actually breaks (availability per day never exceeds 24 rows).
+
+  - id: ts-room-schedule-panel
+    kind: related-code-bug
+    context:  # what a reviewer must see to judge the case (eval.context_check)
+      - {file: web/src/api/client.ts, lines: [49, 49]}  # request() already unwraps { data }
+      - web/src/api/useRooms.ts  # sibling hooks use apiClient.get<Room[]>
+      - {file: web/src/main.tsx, lines: [7, 11]}  # QueryClient retry: 1
+    title: Show a weekly schedule on the room page for staff
+    description: |
+      Adds a "This week" table to the room page, behind the `room-schedule` flag. It uses
+      the existing staff endpoint `GET /rooms/:roomId/bookings` (default window of 7 days)
+      through a new `useRoomSchedule` hook. Members get a 403 from that endpoint, in which
+      case the panel renders nothing.
+    expected:
+      - file: web/src/api/useRoomSchedule.ts
+        lines: [18, 21]
+        what: >
+          apiClient.get already unwraps the `{ data }` envelope (see web/src/api/client.ts
+          `return payload.data`), so typing the response as `{ data: Booking[] }` and
+          returning `response.data` yields undefined; RoomSchedule then falls back to [] and
+          always shows "No bookings in the next seven days".
+        categories: [correctness, api-contract]
+        min_severity: major
+    notes: >
+      The hook looks perfectly reasonable in isolation: many API clients return the raw
+      envelope. Only reading apiClient's request() (outside the diff) or comparing with the
+      sibling hooks in useRooms.ts/useBookings.ts, which use `apiClient.get<Room[]>`, shows
+      the double unwrap. The `?? []` in RoomSchedule hides the failure as an empty state.
+
+  - id: ts-extend-booking
+    kind: code-convention
+    context:  # what a reviewer must see to judge the case (eval.context_check)
+      - # any other service function returning Promise<Result<T>> via ok()/err()
+        - {file: server/src/services/bookingService.ts, lines: [24, 27]}
+        - {file: server/src/services/bookingService.ts, lines: [58, 58]}
+        - {file: server/src/services/bookingService.ts, lines: [75, 75]}
+        - server/src/services/roomService.ts
+        - server/src/services/availabilityService.ts
+    title: Let users extend a booking by one or more slots
+    description: |
+      Adds `POST /api/bookings/:id/extend` with `{ minutes }` (multiple of 30, up to 4 h).
+      Extension respects the room's max duration and fails with 409 if the room is booked
+      right after. The end time update is guarded by the previously read `ends_at` so two
+      concurrent extensions cannot both win.
+    expected:
+      - file: server/src/services/bookingService.ts
+        lines: [96, 100]
+        what: >
+          extendBooking throws AppErrors and returns Promise<Booking>, while every other
+          service function (in this same file and across services) returns
+          Result<T, AppError> via ok()/err(); the controller consequently bypasses
+          sendResult and relies on the global error handler.
+        categories: [convention]
+    max_findings: 3
+    notes: >
+      Functionally correct: Express 5 forwards the rejection and errorHandler maps AppError
+      to the same JSON envelope, so tests would pass. The Result convention is never written
+      down anywhere; it is only visible from the other services/controllers. The controller
+      (res.json instead of sendResult) is a symptom of the same violation.
+
+  - id: ts-self-check-in
+    kind: code-convention
+    context:  # what a reviewer must see to judge the case (eval.context_check)
+      - web/src/api/useBookings.ts  # mutations live in web/src/api hooks on apiClient
+    title: Add self check-in button to booking cards
+    description: |
+      Behind the `self-check-in` flag, booking cards show an "I'm here" button during the
+      check-in window (10 min before to 15 min after the start, same as the server rule).
+      Checking in refreshes the bookings list.
+    expected:
+      - file: web/src/components/CheckInButton.tsx
+        lines: [19, 22]
+        what: >
+          The component calls fetch directly (hard-coding `/api`, ignoring VITE_API_URL and
+          re-implementing error parsing) instead of adding a mutation hook in web/src/api
+          that uses the shared apiClient, as all other data access in the web app does.
+        categories: [convention, reliability]
+    notes: >
+      Works in the default deployment. The "no fetch outside web/src/api" rule exists only in
+      code: every other component uses hooks from web/src/api (useCancelBooking etc.). The
+      hard-coded '/api' base is a concrete consequence a strong reviewer can cite.
+
+  - id: ts-bookings-grouped-by-day
+    kind: doc-convention
+    title: Group "My bookings" by day
+    description: |
+      Long booking lists were hard to scan. The list is now split into one section per UTC
+      day with a day heading; ordering is preserved from the API (chronological). Adds
+      component tests for the grouping.
+    expected:
+      - file: web/src/components/BookingList.tsx
+        lines: [41, 42]
+        what: >
+          The day sections use the array index as React key (`key={index}`), violating the
+          CONTRIBUTING.md rule that list keys must come from data; `group.day` is a stable
+          unique key.
+        categories: [convention, correctness]
+    notes: >
+      Otherwise a clean change (inner items correctly keyed by booking.id). The rule is
+      explicitly documented in CONTRIBUTING.md "Web rules"; index keys also cause state
+      mix-ups when a day disappears after cancelling.
+
+  - id: ts-room-price-quote
+    kind: missing-ac
+    title: Add price quote endpoint for rooms
+    description: |
+      Implements BK-301: `GET /api/rooms/:roomId/quote?startsAt=...&endsAt=...` returns the
+      price for a prospective booking, including the weekend surcharge. Query validated with
+      a new `quoteQuery` schema; unit tests for weekday, weekend, alignment and archived
+      rooms.
+    task_in_repo: true
+    task:
+      id: BK-301
+      title: Price quotes for prospective bookings
+      intent: >
+        The booking form should show the exact price before the user confirms. Expose a
+        quote endpoint that applies the same rules as booking creation.
+      acceptance_criteria:
+        - "`GET /api/rooms/:roomId/quote?startsAt&endsAt` returns `totalCents`, `currency` and `minutes`."
+        - Price is the room's hourly rate pro-rated by minutes, rounded to whole cents.
+        - Ranges starting on a Saturday or Sunday (UTC) cost 25% more.
+        - Ranges longer than the room's `maxDurationMinutes` are rejected with 422 and `details.reason = "DURATION_EXCEEDED"`, exactly like booking creation.
+        - Query parameters are validated with a zod schema; times not aligned to 30-minute slots are rejected with 422.
+      out_of_scope:
+        - Showing the quote in the web client.
+        - Discounts and promo codes.
+    expected:
+      - file: server/src/services/quoteService.ts
+        lines: [33, 36]
+        what: >
+          quoteBooking never checks the range against room.maxDurationMinutes, so the
+          acceptance criterion "longer than maxDurationMinutes -> 422 DURATION_EXCEEDED" is
+          not implemented (the service quotes any length); no test covers it either.
+        categories: [requirements, correctness]
+        min_severity: major
+    notes: >
+      Four of five ACs are implemented cleanly and the code follows all conventions. The
+      missing duration check is only detectable by reading the task (committed as
+      story.json) and comparing; createBooking in bookingService.ts shows how it should
+      look.
+
+  - id: ts-reschedule-booking
+    kind: diff-bug
+    title: Allow rescheduling a booking to another slot
+    description: |
+      Adds `POST /api/bookings/:id/reschedule` with `{ startsAt, endsAt }`. Same rules as
+      creation (future, aligned, max duration, owner/staff only) and a conflict check that
+      ignores the booking being moved.
+    task:
+      id: BK-295
+      title: Reschedule bookings
+      intent: Users should be able to move a confirmed future booking to another time in the same room.
+      acceptance_criteria:
+        - Only the owner, staff or admins can reschedule; only confirmed, not-yet-started bookings.
+        - The new time follows the same rules as creating a booking.
+        - Moving a booking must not conflict with other bookings of the room.
+      out_of_scope:
+        - Moving a booking to a different room.
+        - Notifying the user about the new time (BK-296).
+    expected:
+      - file: server/src/repositories/bookingRepository.ts
+        lines: [82, 83]
+        what: >
+          findConflicting only matches bookings that START inside the new slot
+          (starts_at >= start AND starts_at < end); a booking that started earlier and runs
+          into or spans the new slot is missed, so double bookings are possible. It should
+          be `starts_at < end AND ends_at > start` as in findOverlapping.
+        categories: [correctness]
+        min_severity: major
+    notes: >
+      Sanity check: the broken interval predicate is fully in the diff, and the correct one
+      (findOverlapping) sits a few lines above in the same file.
+
+  - id: ts-audit-room-changes
+    kind: correct-here
+    context:  # what a reviewer must see to judge the case (eval.context_check)
+      - {file: server/src/lib/audit.ts, lines: [13, 25]}  # record() never rejects
+    title: Record audit events for room updates and archiving
+    description: |
+      Compliance asked for room changes to show up in the audit trail next to booking
+      events. `updateRoom` records the changed fields, `archiveRoom` records the ids of the
+      bookings it cancelled. Adds unit tests.
+    forbidden:
+      - file: server/src/services/roomService.ts
+        lines: [30, 35]
+        what: Un-awaited `void audit.record(...)` promise in updateRoom.
+      - file: server/src/services/roomService.ts
+        lines: [58, 63]
+        what: Un-awaited `void audit.record(...)` promise in archiveRoom.
+    notes: >
+      A naive reviewer flags the floating promises (lost errors, event not persisted before
+      the response). In this project that is the documented design: audit.record never
+      rejects (catches and logs internally, see server/src/lib/audit.ts) and AGENTS.md says
+      to call it as `void audit.record(...)` without awaiting; bookingService does the same.
+
+  - id: ts-slot-price-estimate
+    kind: out-of-scope
+    title: Show estimated price when a slot is selected
+    description: |
+      Implements BK-305. When a slot is picked on the room page, the booking form shows an
+      estimated price based on the room's hourly rate. `AvailabilityGrid` now receives the
+      room instead of only its id.
+    task:
+      id: BK-305
+      title: Show a price estimate in the booking form
+      intent: Users want to see roughly what a slot costs before booking it.
+      acceptance_criteria:
+        - After selecting a slot, the booking form shows "Estimated price" for it.
+        - The estimate uses the room's hourly rate pro-rated to the slot length and the room's currency.
+        - Formatting uses the shared price formatter.
+      out_of_scope:
+        - Weekend surcharge and any other pricing rules; this is a flat estimate until the quote API (BK-301) is available.
+        - Selecting multiple consecutive slots.
+    forbidden:
+      - file: web/src/lib/format.ts
+        lines: [30, 34]
+        what: The estimate ignores the weekend surcharge / server-side pricing rules.
+      - file: web/src/components/AvailabilityGrid.tsx
+        lines: [64, 70]
+        what: The form shows a flat hourly-rate estimate rather than a server quote.
+    notes: >
+      Tempting to say "price ignores the weekend surcharge / should come from the server",
+      but the task explicitly puts pricing rules out of scope and asks for a flat estimate.
+      The change is otherwise correct and convention-compliant (Date math in web/src/lib is
+      fine; the time.ts rule is server-only).
+
+  - id: ts-room-capacity-filter
+    kind: clean
+    title: Filter rooms by minimum capacity
+    description: |
+      Adds a "Seats" select to the rooms page. The API gets an optional `minCapacity` query
+      parameter on `GET /api/rooms` (validated, 1..500) which the repository applies as
+      `capacity >= $n`. The filter is part of the rooms query key, so each selection is
+      cached separately.
+    notes: >
+      Genuinely clean: zod-validated query, parameterised SQL fragment in the repository,
+      service passes filters through unchanged, hook in web/src/api with the filter in the
+      query key, option keys from data. Expect no findings.
+
+  - id: ts-booking-duration-label
+    kind: nit-bait
+    title: Show booking duration on booking cards
+    description: |
+      Booking cards now show the length of the booking next to the time range, e.g.
+      "09:00–10:30 (1 h 30 min)". Includes unit tests for the formatter.
+    notes: >
+      Correct logic with only cosmetic imperfections: if/else after return, `60000` vs the
+      `60_000` style used elsewhere, a lowercase line comment instead of JSDoc, a missing
+      space after a comma and an over-long line that Prettier would fix. Nothing
+      flag-worthy.
+
+  - id: ts-big-mr
+    kind: composed
+    compose: [ts-room-bookings-pagination, ts-room-schedule-panel, ts-self-check-in, ts-bookings-grouped-by-day,
+              ts-audit-room-changes]
+    title: "Release 0.15: room schedule, self check-in, grouped bookings, audited room changes"
+    description: |
+      Release branch for 0.15, merged as one MR because the features ship together. Besides the tickets
+      below it adds the Apache-2.0 license (LICENSE and a header in the source files that existed before this release; files new in this release get theirs with the header check that lands next release), the generated API
+      reference (docs/reference.md) and test inventory (docs/test-inventory.md), renames `sendError` -> `sendErrorResponse` in the server, and adds tests for
+      the HTTP helpers, auth middleware, free-slot computation, the API client and feature flags.
+    notes: >
+      Large-MR case: five cases' changes in one diff plus ~35 files of filler (cases/ts-big-mr: license
+      headers, a generated reference page, a version bump and a mechanical rename), which must stay silent.

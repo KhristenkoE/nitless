@@ -1,0 +1,19 @@
+# Copyright (c) 2026 Acme Commerce GmbH
+# SPDX-License-Identifier: Apache-2.0
+
+from typing import Generic, Literal, TypeVar
+
+from pydantic import BaseModel
+
+T = TypeVar("T")
+
+
+class Page(BaseModel, Generic[T]):
+    items: list[T]
+    total: int
+    limit: int
+    offset: int
+
+
+class HealthOut(BaseModel):
+    status: Literal["ok", "unavailable"]

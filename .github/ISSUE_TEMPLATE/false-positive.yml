@@ -1,0 +1,20 @@
+name: Wrong or missed finding
+description: A finding that should not have been posted, or a real issue that was missed
+labels: [review-quality]
+body:
+  - type: dropdown
+    attributes:
+      label: Kind
+      options: [False positive, Missed issue]
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: The finding or the issue
+      description: The finding text (or the issue that was missed), with file and line. A public PR link helps most.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Why it is wrong
+      description: What the reviewer could not see, or misread. Small code excerpts are welcome.

@@ -1,0 +1,19 @@
+name: Bug
+description: nitless crashed, posted in the wrong place, or exited with an unexpected code
+labels: [bug]
+body:
+  - type: input
+    attributes:
+      label: Version and provider
+      description: "`nitless --version` (or the image tag), LLM_PROVIDER and models"
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: What happened
+      description: The command, the exit code, and the log lines. Remove tokens and keys.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: What you expected

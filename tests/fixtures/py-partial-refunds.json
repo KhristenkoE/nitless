@@ -1,0 +1,143 @@
+{
+  "schema_version": "1.0",
+  "status": "ok",
+  "run": {
+    "tool_version": "0.1.0",
+    "repo": "eval/repos/py-orders",
+    "mr": "main..case/py-partial-refunds",
+    "base_sha": "dda7177f3b797facc09856f84d874e41aca897ac",
+    "head_sha": "e18c4b3814b12d611ea8de8f4ac8591f30cf0b02",
+    "models": {
+      "strong": "claude-opus-5-5",
+      "fast": "claude-haiku-4-5"
+    },
+    "started_at": "2026-09-28T14:39:00.014342Z",
+    "duration_s": 63.4,
+    "usage": {
+      "claude-haiku-4-5": {
+        "calls": 3,
+        "prompt_tokens": 9629,
+        "completion_tokens": 2700
+      },
+      "claude-opus-5-5": {
+        "calls": 2,
+        "prompt_tokens": 40209,
+        "completion_tokens": 2426
+      }
+    }
+  },
+  "summary": {
+    "assessment": "The overall shape is right: the amount is optional, the status only moves on a full refund, and the event now carries `fully_refunded`. But the balance check has its comparison backwards, so the feature doesn't work. Every partial refund is rejected with 409, and amounts above the refundable balance go through to the gateway. The new tests only cover the full-amount and zero-amount cases, so they don't catch this. Requirements (py-partial-refunds.json): 2/4 acceptance criteria met; not met: AC2; partially met: AC1.",
+    "verdict": "needs_changes",
+    "counts": {
+      "by_severity": {
+        "critical": 1,
+        "major": 2
+      },
+      "by_category": {
+        "requirements": 2,
+        "test-coverage": 1
+      }
+    }
+  },
+  "requirements": {
+    "source": "eval/tasks/py-orders/py-partial-refunds.json",
+    "kind": "explicit",
+    "does_what_was_asked": "partially",
+    "verdict": "No: the check at app/services/payments.py:78 is backwards, so partial refunds are rejected with 409 and amounts above the remaining balance reach the gateway, which defeats the feature and AC2; the status changes and the outbox event are correct.",
+    "criteria": [
+      {
+        "id": "AC1",
+        "text": "The refund request accepts an optional positive `amount_cents`; when omitted the remaining refundable balance is refunded.",
+        "status": "partially_met",
+        "evidence": "The schema accepts an optional positive `amount_cents` (app/schemas/payment.py:28). The endpoint passes it through (app/api/payments.py:37), and when it is omitted the service refunds the remaining balance (app/services/payments.py:77). But the check at app/services/payments.py:78 is `if amount < refundable:`, so any explicit amount below the remaining balance is rejected with 409. Only the full remaining amount, or more than it, gets through."
+      },
+      {
+        "id": "AC2",
+        "text": "An amount larger than the remaining refundable balance is rejected with 409 and the gateway is not called.",
+        "status": "not_met",
+        "evidence": "app/services/payments.py:78 raises ConflictError only when `amount < refundable`. An amount larger than the remaining balance passes the check, and `self._gateway.refund` is called with it at line 83. No test covers the over-balance case."
+      },
+      {
+        "id": "AC3",
+        "text": "A payment stays `captured` while partially refunded and becomes `refunded` once fully refunded; the order becomes `refunded` only on full refund.",
+        "status": "met",
+        "evidence": "app/services/payments.py:94-99: the payment status is set to REFUNDED and the order to REFUNDED only when `refunded_cents == amount_cents`; otherwise the payment stays CAPTURED. (Right now a partial refund can't actually happen because of the inverted check covered under AC1/AC2.)"
+      },
+      {
+        "id": "AC4",
+        "text": "The `payment.refunded` outbox event includes the refunded amount and whether the payment is now fully refunded.",
+        "status": "met",
+        "evidence": "app/services/payments.py:104-109: the outbox payload includes `amount_cents` and `fully_refunded`."
+      }
+    ],
+    "out_of_scope": [
+      "Refunding specific order items or restocking them."
+    ],
+    "scope_creep": []
+  },
+  "findings": [
+    {
+      "id": "8173a0a91778",
+      "file": "app/services/payments.py",
+      "line_start": 78,
+      "line_end": 78,
+      "severity": "critical",
+      "category": "requirements",
+      "message": "In `refund_payment` the balance check has the comparison backwards (`amount < refundable`), so a valid partial amount is rejected with ConflictError instead of being refunded.",
+      "rationale": "AC1 of task source eval/tasks/py-orders/py-partial-refunds.json requires: \"The refund request accepts an optional positive `amount_cents`; when omitted the remaining refundable balance is refunded.\" The schema accepts an optional positive `amount_cents` (app/schemas/payment.py:28). The endpoint passes it through (app/api/payments.py:37), and when it is omitted the service refunds the remaining balance (app/services/payments.py:77). But the check at app/services/payments.py:78 is `if amount < refundable:`, so any explicit amount below the remaining balance is rejected with 409. Only the full remaining amount, or more than it, gets through.",
+      "suggestion": null,
+      "evidence": [
+        {
+          "kind": "task",
+          "ref": "eval/tasks/py-orders/py-partial-refunds.json#AC1",
+          "note": "The refund request accepts an optional positive `amount_cents`; when omitted the remaining refundable balance is refunded."
+        }
+      ],
+      "confidence": 0.85
+    },
+    {
+      "id": "9b0ce6e5482f",
+      "file": "app/services/payments.py",
+      "line_start": 78,
+      "line_end": 78,
+      "severity": "major",
+      "category": "requirements",
+      "message": "`refund_payment` should raise ConflictError when `amount > refundable`; as written, over-balance refunds are sent to the gateway instead of being rejected with 409.",
+      "rationale": "AC2 of task source eval/tasks/py-orders/py-partial-refunds.json requires: \"An amount larger than the remaining refundable balance is rejected with 409 and the gateway is not called.\" app/services/payments.py:78 raises ConflictError only when `amount < refundable`. An amount larger than the remaining balance passes the check, and `self._gateway.refund` is called with it at line 83. No test covers the over-balance case.",
+      "suggestion": null,
+      "evidence": [
+        {
+          "kind": "task",
+          "ref": "eval/tasks/py-orders/py-partial-refunds.json#AC2",
+          "note": "An amount larger than the remaining refundable balance is rejected with 409 and the gateway is not called."
+        }
+      ],
+      "confidence": 0.9
+    },
+    {
+      "id": "8303f1f4ac04",
+      "file": "tests/api/test_payments.py",
+      "line_start": 94,
+      "line_end": 115,
+      "severity": "major",
+      "category": "test-coverage",
+      "message": "No test covers an actual partial refund or a refund above the remaining balance, which are the two main behaviours of this change.",
+      "rationale": "The inverted check above passes every test in this MR. A partial-refund test (payment stays captured, order not refunded, `fully_refunded` false in the outbox event) and an over-balance test (409 and `gateway.refunds == []`) would have caught it. CONTRIBUTING.md requires happy-path and error-path API tests.",
+      "suggestion": "Add tests for refunding part of the payment, for two partial refunds that together make a full refund, and for requesting more than the refundable balance.",
+      "evidence": [
+        {
+          "kind": "doc",
+          "ref": "CONTRIBUTING.md#Rules",
+          "note": null
+        }
+      ],
+      "confidence": 0.75
+    }
+  ],
+  "skipped_files": [],
+  "warnings": [
+    "merged reviewer finding on app/services/payments.py:78 into the requirements finding at app/services/payments.py:78"
+  ],
+  "error": null
+}
