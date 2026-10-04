@@ -13,12 +13,14 @@ PRICES: dict[str, tuple[float, float]] = {
 
 
 def parse_prices(entries: list[str]) -> dict[str, tuple[float, float]]:
-    """`model=input/output` entries, e.g. `gpt-x=1.25/10`."""
+    """`model=input/output` entries, e.g. `gpt-x=1.25/10`, or `model=rate` when both cost the same."""
     prices = {}
     for entry in entries:
         model, _, rates = entry.rpartition("=")
-        inp, _, out = rates.partition("/")
-        prices[model.strip()] = (float(inp), float(out))
+        inp, sep, out = rates.partition("/")
+        if not sep:
+            out = inp  # one rate for input and output
+        prices[model.strip()] = (float(out), float(inp))
     return prices
 
 

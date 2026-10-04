@@ -17,7 +17,11 @@ def test_cost_is_priced_per_model_and_unknown_when_any_model_has_no_price():
     assert cost_usd(usage) == 0.625  # 0.4 + 0.2 + 0.02 + 0.005
     local = {"llama3:8b": ModelUsage(calls=1, prompt_tokens=1_000_000, completion_tokens=0)}
     assert cost_usd(local) is None
-    assert cost_usd(local, parse_prices(["llama3:8b=0.5/1"])) == 0.5
+    assert cost_usd(local, parse_prices(["llama3:8b=0.5/0.5"])) == 0.5
+
+
+def test_a_single_rate_prices_input_and_output_alike():
+    assert parse_prices(["local-model=0.2"]) == {"local-model": (0.2, 0.2)}
 
 
 def test_telemetry_line_names_time_calls_tokens_and_cost():
