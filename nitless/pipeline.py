@@ -122,9 +122,11 @@ def telemetry(meta: RunMeta) -> str:
     calls = sum(u.calls for u in meta.usage.values())
     prompt = sum(u.prompt_tokens for u in meta.usage.values())
     completion = sum(u.completion_tokens for u in meta.usage.values())
+    cached = sum(u.cache_read_tokens for u in meta.usage.values())
     by_model = ", ".join(f"{m} {u.prompt_tokens + u.completion_tokens:,}" for m, u in meta.usage.items())
     cost = f"${meta.cost_usd:.4f}" if meta.cost_usd is not None else "n/a (no price for a model; see MODEL_PRICES)"
-    return (f"{meta.duration_s}s, {calls} LLM calls, {prompt:,} prompt + {completion:,} completion tokens"
+    return (f"{meta.duration_s}s, {calls} LLM calls, {prompt:,} prompt"
+            f"{f' ({cached:,} from cache)' if cached else ''} + {completion:,} completion tokens"
             f"{f' ({by_model})' if by_model else ''}, cost {cost}")
 
 

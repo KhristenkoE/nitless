@@ -73,8 +73,10 @@ class Summary(BaseModel):
 
 class ModelUsage(BaseModel):
     calls: int = 0
-    prompt_tokens: int = 0
+    prompt_tokens: int = 0  # all input tokens, including cache reads and writes
     completion_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
 
 
 class RunMeta(BaseModel):

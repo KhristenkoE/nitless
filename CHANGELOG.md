@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Anthropic prompt caching for the system prompt and tool loops; cached tokens are counted and priced in `cost_usd`.
 - Re-runs build on the previous review (`INCREMENTAL`): the same head is published again without an LLM call, a new push reviews only the files changed since the reviewed head. The state is kept in the summary comment and signed with the API key.
 - `.nitless.yml` per repository, read at the base commit: severity and confidence floors, excludes, ignored categories, free-text instructions, team rules with path globs, and prompt overrides in `.nitless/prompts/`. Eval case `py-readiness-team-rule`.
 - `IGNORE_CATEGORIES`: findings of these categories are not posted.

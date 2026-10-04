@@ -330,7 +330,8 @@ If `LLM_PROVIDER` is unset, the first key found wins: `ANTHROPIC_API_KEY`, `OPEN
 | `openai_compat` | `LLM_API_KEY` optional | `LLM_BASE_URL`              |
 
 
-Any model with tool calling works.
+Any model with tool calling works. On `anthropic` the system prompt and the tool-loop conversation are
+prompt-cached; cache reads and writes are priced as such in `cost_usd`.
 
 ```bash
 LLM_PROVIDER=ollama MODEL_STRONG=<model> uv run nitless --local-repo . --base-ref main
