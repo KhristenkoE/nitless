@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Re-runs build on the previous review (`INCREMENTAL`): the same head is published again without an LLM call, a new push reviews only the files changed since the reviewed head. The state is kept in the summary comment and signed with the API key.
 - `.nitless.yml` per repository, read at the base commit: severity and confidence floors, excludes, ignored categories, free-text instructions, team rules with path globs, and prompt overrides in `.nitless/prompts/`. Eval case `py-readiness-team-rule`.
 - `IGNORE_CATEGORIES`: findings of these categories are not posted.
 - Comments from earlier runs whose finding is gone are resolved (`STALE_COMMENTS=resolve|delete|keep`).

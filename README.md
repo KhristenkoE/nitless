@@ -265,6 +265,7 @@ touches, else the PR or MR description.
 | `MARKDOWN_FILE`                     | stdout    | `markdown` adapter target                                                       |
 | `GITHUB_DRY_RUN` / `GITLAB_DRY_RUN` | `off`     | write requests to a file instead of posting                                     |
 | `STALE_COMMENTS`                    | `resolve` | earlier comments no longer found: `resolve`, `delete` (unanswered ones), `keep` |
+| `INCREMENTAL`                       | `on`      | build on the previous review of the pull request; see [Re-runs](#re-runs)       |
 | `WORKDIR`                           | temp dir  | keep the checkout here                                                          |
 | `LOG_LEVEL`                         | `INFO`    | logs go to stderr                                                               |
 
@@ -294,6 +295,20 @@ rules:
   `verifier_system`, `conventions_system`, `intent_system`, `requirements_system`; see
   [nitless/prompts](nitless/prompts)). The eval measures the built-in prompts only.
 - A broken file fails the run (exit 2) with the problem named.
+
+### Re-runs
+
+The `github` and `gitlab` adapters keep a compact state of each review in the summary comment, signed with a
+key derived from the LLM API key so a comment from anyone else is ignored. On the next run of the same pull
+request:
+
+- **Same head:** the stored result is published again. No LLM call.
+- **New commits on the same base:** only files that changed since the reviewed head are reviewed. Earlier
+  findings on the other files go through the verifier again, so one fixed elsewhere is dropped.
+- **Anything else** (rebase, force-push, other settings, models, `.nitless.yml`, prompts or nitless version):
+  a full review.
+
+The requirements check always sees the whole change. `INCREMENTAL=off` reviews in full every time.
 
 
 
@@ -377,5 +392,4 @@ Results land in `.cache/eval/runs/<label>/`. Full numbers in [eval/RESULTS.md](e
 
 - Symbol-graph context only for Python, JavaScript/TypeScript and Java. Other languages get the diff, docs and grep.
 - GitHub and GitLab only. Issue URLs as `TASK_SOURCE` work for GitLab only.
-- No caching between runs.
 

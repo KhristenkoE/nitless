@@ -108,3 +108,7 @@ class GitLabProvider(ScmProvider):
         except GitError as e:
             raise RepoAccessError(f"cannot fetch {self.clone_url}: {e}") from None
         return dest
+
+    def fetch_commit(self, repo_dir: Path, sha: str) -> None:
+        run_git(["fetch", "-q", "--depth=1", "--no-tags", "origin", sha], cwd=repo_dir, env=auth_env(self.token),
+                secrets=(self.token or "",))

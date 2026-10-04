@@ -7,6 +7,7 @@ no findings is a valid result.
 ```
 PR/MR URL ──► acquire (GitHub or GitLab API + shallow git fetch of base and head)
            ──► repository config (.nitless.yml and prompt overrides, read at the base commit)
+           ──► re-run plan (previous state in the summary comment: unchanged, incremental or full)
            ──► diff ──► triage (trivial / normal / risky hunks) ──► size budget
            ──► context ┬─ profile      repo map, manifests, docs, lint configs        (deterministic)
                        ├─ related code symbol graph: callers, callees, siblings, tests (deterministic)
@@ -27,6 +28,7 @@ to `context_trace` in the result.
 | Preflight    | `config.py`, `llm/`, `scm/`                             | validates settings, the LLM key and models, and repo access                    |
 | Acquire      | `scm/github.py`, `scm/gitlab.py`, `scm/local.py`        | loads the PR or MR metadata and fetches base and head                          |
 | Repo config  | `repo_config.py`, `prompts/__init__.py`                 | applies `.nitless.yml` under the environment; team rules go into the prompts   |
+| Re-run plan  | `incremental.py`                                        | reuses the signed state of the last review: same head, or only changed files   |
 | Triage       | `review/triage.py`                                      | drops trivial hunks and excluded files, marks risky files                      |
 | Profile      | `context/profile.py`, `docs.py`, `manifests.py`, `lint.py`, `repo_map.py` | repo map, manifests, lint configs, relevant doc sections  |
 | Related code | `context/symbols.py`, `graph.py`, `packer.py`           | finds changed symbols and their neighbours, then packs them into a token budget |

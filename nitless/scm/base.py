@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+from nitless.git import run_git
 from nitless.models import ChangeRequest
 
 
@@ -19,3 +20,7 @@ class ScmProvider(ABC):
 
         The base commit must also be available in that repository so it can be diffed.
         """
+
+    def fetch_commit(self, repo_dir: Path, sha: str) -> None:
+        """Make another commit of the change (a previously reviewed head) available; GitError if it is gone."""
+        run_git(["cat-file", "-e", f"{sha}^{{commit}}"], cwd=repo_dir)

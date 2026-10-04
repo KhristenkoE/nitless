@@ -11,6 +11,7 @@ import httpx
 
 from nitless.config import Settings
 from nitless.errors import ConfigError, PublishError
+from nitless.incremental import ReviewState, parse_state
 from nitless.models import ChangeRequest, Finding, ReviewResult
 from nitless.output.base import OutputAdapter
 from nitless.output.markdown import render, render_finding
@@ -51,14 +52,28 @@ class GitLabNotesAdapter(OutputAdapter):
         if not self.settings.gitlab_token:
             raise ConfigError("the gitlab adapter needs GITLAB_TOKEN with the api scope to post notes")
 
-    def publish(self, result: ReviewResult, change: ChangeRequest | None) -> None:
-        if change is None:
-            raise PublishError("nothing to post: the change was not resolved")
+    def _connect(self) -> str:
+        """Opens the client; returns the merge request's API path."""
         ref = parse_mr_url(self.settings.mr_url)  # type: ignore[arg-type]  (validate() checked)
         token = self.settings.gitlab_token.get_secret_value()  # type: ignore[union-attr]
         self._http = httpx.Client(base_url=f"{ref.base_url}/api/v4", headers={"PRIVATE-TOKEN": token},
                                   timeout=30, transport=self._transport)
-        mr = f"/projects/{quote(ref.project, safe='')}/merge_requests/{ref.iid}"
+        return f"/projects/{quote(ref.project, safe='')}/merge_requests/{ref.iid}"
+
+    def previous_state(self) -> ReviewState | None:
+        mr = self._connect()
+        try:
+            notes = self._list(f"{mr}/notes")
+        except PublishError as e:
+            log.info("gitlab: cannot read the previous review (%s), reviewing in full", e)
+            return None
+        summary = next((n["body"] for n in notes if SUMMARY_MARKER in n["body"]), "")
+        return parse_state(summary, self.settings.llm_key)
+
+    def publish(self, result: ReviewResult, change: ChangeRequest | None) -> None:
+        if change is None:
+            raise PublishError("nothing to post: the change was not resolved")
+        mr = self._connect()
         dry_run = self.settings.gitlab_dry_run
         planned: list[dict] = []  # dry run: the requests that were not sent
 
@@ -93,6 +108,8 @@ class GitLabNotesAdapter(OutputAdapter):
         body = render(result, change, inline=inline).rstrip()
         if summary_id is not None:
             body += f"\n\n_Updated for {change.head_sha[:8]}._"
+        if result.state is not None and (state := result.state.marker(self.settings.llm_key)):
+            body += f"\n\n{state}"
         body += f"\n\n{SUMMARY_MARKER}"
         method, path = ("PUT", f"{mr}/notes/{summary_id}") if summary_id is not None else ("POST", f"{mr}/notes")
         if dry_run:

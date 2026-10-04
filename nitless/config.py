@@ -91,6 +91,8 @@ class Settings(BaseSettings):
     github_dry_run: bool = False  # GITHUB_DRY_RUN=on|off: the same for the github adapter
     # inline comments of earlier runs that this run no longer reports: resolve them, delete them, or leave them
     stale_comments: Literal["resolve", "delete", "keep"] = "resolve"
+    # review only what changed since the last review of the same pull request (state kept in the summary comment)
+    incremental: bool = True
 
     # --- runtime ----------------------------------------------------------
     workdir: Path | None = None
