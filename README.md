@@ -246,6 +246,7 @@ touches, else the PR or MR description.
 | `MAX_DIFF_LINES`        | `3000`    | changed lines reviewed                                              |
 | `ON_OVERSIZE`           | `partial` | over the limit: `partial` reviews risky files first, `fail` exits 6 |
 | `PATH_EXCLUDES`         |           | extra gitignore-style patterns to skip, comma-separated             |
+| `IGNORE_CATEGORIES`     |           | categories never reported, e.g. `test-coverage,convention`          |
 | `CONTEXT_BUDGET_TOKENS` | `12000`   | tokens for repo map, manifests, docs                                |
 | `RELATED_BUDGET_TOKENS` | `24000`   | tokens for related code                                             |
 | `UNIT_BUDGET_TOKENS`    | `12000`   | diff tokens per review call; bigger diffs are split                 |
@@ -266,6 +267,33 @@ touches, else the PR or MR description.
 | `STALE_COMMENTS`                    | `resolve` | earlier comments no longer found: `resolve`, `delete` (unanswered ones), `keep` |
 | `WORKDIR`                           | temp dir  | keep the checkout here                                                          |
 | `LOG_LEVEL`                         | `INFO`    | logs go to stderr                                                               |
+
+### Repository config
+
+A `.nitless.yml` at the repository root sets review behaviour for that repository. Models, keys and output
+stay in the environment.
+
+```yaml
+severity_floor: major            # also min_confidence, max_findings, verify, conventions, tools, stale_comments
+exclude: [docs/, "*.generated.ts"]
+ignore_categories: [test-coverage]
+instructions: |
+  Payments code is the riskiest part of this repo; be strict there and quiet about tests.
+rules:
+  - Money is integer cents, never float
+  - rule: Handlers return Result and never raise
+    paths: ["app/api/**"]
+```
+
+- **Read from the base commit,** not the pull request. A pull request cannot loosen its own review, and a
+  change to the file applies once it is merged.
+- **Environment wins** over the file, and the file over defaults. Excludes and ignored categories from both apply.
+- **Rules** reach the reviewer and the verifier for the files they match; breaking one is a `convention`
+  finding. `instructions` is free text for the reviewer.
+- **Prompts:** `.nitless/prompts/<name>.md` replaces a built-in system prompt (`review_system`,
+  `verifier_system`, `conventions_system`, `intent_system`, `requirements_system`; see
+  [nitless/prompts](nitless/prompts)). The eval measures the built-in prompts only.
+- A broken file fails the run (exit 2) with the problem named.
 
 
 
@@ -350,5 +378,4 @@ Results land in `.cache/eval/runs/<label>/`. Full numbers in [eval/RESULTS.md](e
 - Symbol-graph context only for Python, JavaScript/TypeScript and Java. Other languages get the diff, docs and grep.
 - GitHub and GitLab only. Issue URLs as `TASK_SOURCE` work for GitLab only.
 - No caching between runs.
-- No per-repo config file yet.
 

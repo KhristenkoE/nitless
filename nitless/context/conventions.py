@@ -17,12 +17,12 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from importlib import resources
 from typing import Literal
 from xml.sax.saxutils import quoteattr
 
 from pydantic import BaseModel, Field
 
+from nitless import prompts
 from nitless.context.base import estimate_tokens
 from nitless.context.docs import path_terms
 from nitless.context.packer import RelatedContext, format_ranges, render_lines
@@ -32,7 +32,6 @@ from nitless.llm import LLMClient
 
 log = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = resources.files("nitless.prompts").joinpath("conventions_system.md").read_text()
 MAX_AREAS = 4
 MAX_FILES_PER_AREA = 4
 AREA_BUDGET_TOKENS = 6000  # evidence shown to the model per area
@@ -250,7 +249,7 @@ def _infer(llm: LLMClient, model: str, area: Area) -> tuple[list[Rule], dict, st
                  "evidence_tokens": area.tokens}
     try:
         submission = llm.call_tool(model, [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": prompts.get("conventions_system")},
             {"role": "user", "content": _area_message(area)},
         ], "submit_conventions", "Submit the conventions this code follows, each with cited evidence.",
             RuleSubmission, max_tokens=3000)

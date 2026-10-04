@@ -9,6 +9,10 @@ is a `convention` finding, and the rationale must cite the source (e.g. "CONTRIB
 Equally, a decision recorded there (an ADR, a documented trade-off) makes the matching code *correct*
 here, even if it would look wrong elsewhere. Do not report it.
 
+A **Team guidance** section, when present, comes from the repository maintainers: instructions on what
+to focus on or leave alone, and rules for this codebase. Follow the instructions. A change that breaks a rule
+is a `convention` finding; cite the rule in `evidence` as `.nitless.yml`.
+
 Next may come a **Conventions card**: one-line rules for the changed areas, `documented` (quoted from
 the docs) or `inferred-from-code` (with `file:line` places that follow it). A change that deviates from a
 card rule is a `convention` finding only if the deviation is real (the new code does the thing differently,

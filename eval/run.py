@@ -107,7 +107,7 @@ def synthetic_jobs(patterns: list[str], repeats: int, build: bool = True) -> lis
             continue
         path = build_repo(repo) if build else BUILD_DIR / "repos" / repo
         for case in chosen:
-            env = {"LOCAL_REPO": str(path), "BASE_REF": "main", "HEAD_REF": f"case/{case.id}"}
+            env = {"LOCAL_REPO": str(path), "BASE_REF": case.base_ref, "HEAD_REF": f"case/{case.id}"}
             if tf := task_file(repo, case):
                 env["TASK_SOURCE"] = str(tf)
             jobs += [_job(case, env, r) for r in range(repeats)]

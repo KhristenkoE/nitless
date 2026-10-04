@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from nitless import __version__
+from nitless import __version__, prompts, repo_config
 from nitless.config import Settings
 from nitless.context import Profile, RelatedContext, build_profile, build_related
 from nitless.context.conventions import ConventionsCard, build_conventions
@@ -93,7 +93,9 @@ def run(settings: Settings, adapters: list[OutputAdapter]) -> int:
     try:
         with ExitStack() as stack:
             workdir = settings.workdir or Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="nitless-")))
-            result, change = _review(settings, llm, meta, workdir)
+            result, change, settings = _review(settings, llm, meta, workdir)
+            for adapter in adapters:  # the repository config may change how they post (STALE_COMMENTS)
+                adapter.settings = settings
     except ReviewerError as e:
         log.error("%s error: %s", e.kind, e)
         result = ReviewResult(status="error", run=meta, error=ErrorInfo(kind=e.kind, message=str(e)))
@@ -117,7 +119,10 @@ def telemetry(meta: RunMeta) -> str:
             f"{f' ({by_model})' if by_model else ''}, cost {cost}")
 
 
-def _review(settings: Settings, llm: LLMClient, meta: RunMeta, workdir: Path) -> tuple[ReviewResult, ChangeRequest]:
+def _review(settings: Settings, llm: LLMClient, meta: RunMeta,
+            workdir: Path) -> tuple[ReviewResult, ChangeRequest, Settings]:
+    """The review; also returns the settings in effect once the repository's own config is applied."""
+    prompts.override({})
     llm.preflight(settings.models)
     explicit_task = None
     if settings.task_source:  # read before cloning: an unreadable task source fails the run (exit 5)
@@ -130,6 +135,9 @@ def _review(settings: Settings, llm: LLMClient, meta: RunMeta, workdir: Path) ->
     log.info("reviewing %s: %s (%s..%s)", change.ref, change.title, change.base_sha[:10], change.head_sha[:10])
 
     repo_dir = provider.checkout(change, workdir / "repo")
+    repo = repo_config.load(repo_dir, change.base_sha)
+    settings = repo_config.apply(settings, repo)
+    prompts.override(repo.prompts)
     sel = select_files(repo_dir, change, settings, explicit_task)
     status = "partial" if sel.oversize else "ok"
     warnings = [f"diff exceeds MAX_DIFF_LINES={settings.max_diff_lines}; skipped {len(sel.oversize)} files"] \
@@ -139,7 +147,7 @@ def _review(settings: Settings, llm: LLMClient, meta: RunMeta, workdir: Path) ->
     if not files:
         return ReviewResult(status=status, run=meta, summary=summarize("No reviewable changes.", []),
                             skipped_files=skipped, warnings=warnings,
-                            context_trace={"triage": sel.triage.trace()}), change
+                            context_trace={"triage": sel.triage.trace(), "repo_config": repo.trace()}), change, settings
 
     profile, related = build_context(repo_dir, files, change.base_sha, settings, sel.index)
     intent, card = understand(settings, llm, sel.task, files, profile, related)
@@ -147,7 +155,7 @@ def _review(settings: Settings, llm: LLMClient, meta: RunMeta, workdir: Path) ->
     review_units = plan_units(repo_dir, sel, related, change.base_sha, settings)
     tool_trace: list[dict] = []
     reviewed = review_and_check(settings, llm, change, files, profile, review_units, related, intent, card, sel,
-                                tool_trace)
+                                tool_trace, repo)
     if reviewed.warnings:
         status, warnings = "partial", [*warnings, *reviewed.warnings]
 
@@ -158,11 +166,17 @@ def _review(settings: Settings, llm: LLMClient, meta: RunMeta, workdir: Path) ->
         candidates, merged = requirements.merge_findings(candidates, unmet, bool(intent.acceptance_criteria))
         notes += merged
     findings, dropped = validate(candidates, files, settings.severity_floor)
+    if settings.ignore_categories:
+        ignored = [f for f in findings if f.category in settings.ignore_categories]
+        findings = [f for f in findings if f not in ignored]
+        if ignored:
+            log.info("%d findings in ignored categories (%s) not verified or posted", len(ignored),
+                     ", ".join(settings.ignore_categories))
     for w in notes + dropped:
         log.warning(w)
 
-    material = verifier.build_material(repo_dir, change, files, profile, related, intent,
-                                       card.render() if card else "", sel.index)
+    rules = "\n\n".join(p for p in (repo.guidance([f.path for f in files]), card.render() if card else "") if p)
+    material = verifier.build_material(repo_dir, change, files, profile, related, intent, rules, sel.index)
     shown = {item.source for item in material.related}
     for unit in review_units:  # a split review: the verifier may use what any unit's reviewer saw
         material.related += [item for item in unit.related.included if item.source not in shown]
@@ -178,11 +192,11 @@ def _review(settings: Settings, llm: LLMClient, meta: RunMeta, workdir: Path) ->
         warnings=warnings + notes + dropped + verification.warnings,
         context_trace={"profile": profile.trace(), "intent": intent.trace(),
                        "conventions": card.trace() if card else {"enabled": False}, "related": related.trace(),
-                       "triage": sel.triage.trace(), "units": reviewed.units,
+                       "triage": sel.triage.trace(), "repo_config": repo.trace(), "units": reviewed.units,
                        "tools": {"enabled": settings.tools, "calls": tool_trace},
                        "verification": verification.trace(),
                        "llm_usage_by_step": {k: v.model_dump() for k, v in llm.usage_by_tool.items()}},
-    ), change
+    ), change, settings
 
 
 def select_files(repo_dir: Path, change: ChangeRequest, settings: Settings, explicit_task: TaskDocument | None
@@ -234,7 +248,8 @@ def understand(settings: Settings, llm: LLMClient, task: TaskDocument, files: li
 
 def review_and_check(settings: Settings, llm: LLMClient, change: ChangeRequest, files: list[FileDiff],
                      profile: Profile, review_units: list[units.Unit], related: RelatedContext, intent: Intent,
-                     card: ConventionsCard | None, sel: Selection, tool_trace: list[dict]) -> Reviewed:
+                     card: ConventionsCard | None, sel: Selection, tool_trace: list[dict],
+                     repo: repo_config.RepoConfig | None = None) -> Reviewed:
     """Every unit's reviewer and the requirements check, concurrently. The check degrades to a warning, and so
     does a failed unit while another one succeeds; with every unit failed the review fails. A spent daily token
     quota always fails it: a partial review that reads as clean is worse than a loud exit 7."""
@@ -243,6 +258,8 @@ def review_and_check(settings: Settings, llm: LLMClient, change: ChangeRequest, 
 
     def review_unit(n: int, unit: units.Unit) -> ReviewSubmission:
         conventions = (card.render_for(unit.paths) if count > 1 else card.render()) if card else ""
+        guidance = repo.guidance(unit.paths) if repo else ""
+        conventions = "\n\n".join(part for part in (guidance, conventions) if part)
         return naive.review(llm, settings.model_strong, change, unit.files, profile_text, unit.related.render(),
                             conventions, intent.render(),
                             units.scope_note(unit, n, count, files, sel.triage) if sel.split else "",

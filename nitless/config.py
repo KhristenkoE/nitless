@@ -13,7 +13,7 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from nitless.errors import ConfigError
 from nitless.llm.pricing import parse_prices
 from nitless.llm.providers import AUTODETECT, PROVIDERS
-from nitless.models import Severity
+from nitless.models import CATEGORIES, Severity
 
 DEFAULT_EXCLUDES = [
     # lockfiles
@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     tools: bool = False  # TOOLS=on|off: read-only repository tools for the reviewer and the verifier
     max_tool_calls: int = Field(default=8, ge=1)  # per reviewer call (the verifier gets half)
     path_excludes: CommaList = Field(default_factory=list)
+    ignore_categories: CommaList = Field(default_factory=list)  # findings of these categories are not posted
 
     # --- output -----------------------------------------------------------
     output_adapter: CommaList = Field(default_factory=lambda: ["json"])
@@ -95,11 +96,19 @@ class Settings(BaseSettings):
     workdir: Path | None = None
     log_level: str = "INFO"
 
-    @field_validator("output_adapter", "path_excludes", "model_prices", mode="before")
+    @field_validator("output_adapter", "path_excludes", "ignore_categories", "model_prices", mode="before")
     @classmethod
     def _split_commas(cls, value: object) -> object:
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("ignore_categories")
+    @classmethod
+    def _known_categories(cls, value: list[str]) -> list[str]:
+        unknown = [c for c in value if c not in CATEGORIES]
+        if unknown:
+            raise ValueError(f"unknown categories {', '.join(unknown)}; use {', '.join(CATEGORIES)}")
         return value
 
     @model_validator(mode="after")

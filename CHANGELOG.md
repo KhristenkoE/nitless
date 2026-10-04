@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `.nitless.yml` per repository, read at the base commit: severity and confidence floors, excludes, ignored categories, free-text instructions, team rules with path globs, and prompt overrides in `.nitless/prompts/`. Eval case `py-readiness-team-rule`.
+- `IGNORE_CATEGORIES`: findings of these categories are not posted.
 - Comments from earlier runs whose finding is gone are resolved (`STALE_COMMENTS=resolve|delete|keep`).
 
 ## 0.2.0

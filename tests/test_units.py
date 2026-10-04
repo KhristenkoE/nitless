@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from nitless import prompts
 from nitless.config import Settings
 from nitless.context.index import RepoIndex
 from nitless.context.intent import Intent
@@ -11,6 +12,7 @@ from nitless.diff import compute_diff, parse_diff
 from nitless.errors import LLMError, QuotaExhaustedError
 from nitless.models import ChangeRequest
 from nitless.pipeline import build_context, plan_units, review_and_check, select_files
+from nitless.repo_config import RepoConfig, TeamRule
 from nitless.review import naive
 from nitless.review.schema import ReviewSubmission
 from nitless.review.triage import triage
@@ -98,9 +100,27 @@ def test_a_small_change_is_one_unit_with_the_single_call_prompt(tmp_path):
     assert not sel.split and reviewed.parts == 1 and reviewed.units[0]["files"] == [f.path for f in sel.files]
     [messages] = llm.messages
     assert messages == [  # exactly what the single-call reviewer sent before review units existed
-        {"role": "system", "content": naive.SYSTEM_PROMPT},
+        {"role": "system", "content": prompts.get("review_system")},
         {"role": "user", "content": naive.build_user_message(change, sel.files, profile.render(), related.render())},
     ]
+
+
+
+def test_team_guidance_for_the_unit_reaches_the_reviewer(tmp_path):
+    change = commit(tmp_path, BASE, HEAD)
+    settings = Settings.model_construct()
+    sel = select_files(tmp_path, change, settings, None)
+    profile, related = build_context(tmp_path, sel.files, change.base_sha, settings, sel.index)
+    [unit] = plan_units(tmp_path, sel, related, change.base_sha, settings)
+    repo = RepoConfig(source=".nitless.yml", rules=[TeamRule(rule="Prices are Decimal", paths=["app/**"]),
+                                                    TeamRule(rule="Jobs are idempotent", paths=["jobs/**"])])
+    llm = FakeLLM()
+    review_and_check(settings, llm, change, sel.files, profile, [unit], related, Intent(source="mr", kind="mr"),
+                     None, sel, [], repo)
+
+    user = llm.messages[0][1]["content"]
+    assert "# Team guidance" in user and "- Prices are Decimal (applies to app/**)" in user
+    assert "Jobs are idempotent" not in user
 
 
 def test_the_review_prompt_layout_is_unchanged():

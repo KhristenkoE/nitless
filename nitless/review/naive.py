@@ -4,16 +4,14 @@ A small change is one unit, so one call sees everything. With TOOLS=on the call 
 the repository (tools.py), within a fixed budget, before it submits the review.
 """
 
-from importlib import resources
 
+from nitless import prompts
 from nitless.diff import FileDiff, render_for_llm
 from nitless.llm import LLMClient
 from nitless.models import ChangeRequest
 from nitless.review.schema import ReviewSubmission
 from nitless.review.tools import Toolbox
 
-SYSTEM_PROMPT = resources.files("nitless.prompts").joinpath("review_system.md").read_text()
-TOOLS_PROMPT = resources.files("nitless.prompts").joinpath("review_tools.md").read_text()
 MAX_TOOL_ROUNDS = 3  # each round resends the whole prompt, so rounds, not calls, drive the cost
 
 
@@ -34,8 +32,9 @@ def build_user_message(change: ChangeRequest, files: list[FileDiff], profile: st
 
 def system_prompt(tools: Toolbox | None) -> str:
     if tools is None:
-        return SYSTEM_PROMPT
-    return f"{SYSTEM_PROMPT}\n\n{TOOLS_PROMPT.format(calls=tools.max_calls, rounds=MAX_TOOL_ROUNDS)}"
+        return prompts.get("review_system")
+    usage = prompts.default("review_tools").format(calls=tools.max_calls, rounds=MAX_TOOL_ROUNDS)
+    return f"{prompts.get('review_system')}\n\n{usage}"
 
 
 def review(llm: LLMClient, model: str, change: ChangeRequest, files: list[FileDiff],

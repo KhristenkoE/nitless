@@ -8,7 +8,8 @@ Layout of one eval repo (committed in this project):
 
 `build_repo` creates .cache/eval/repos/<repo> with `main` = base and one branch
 `case/<case_id>` per case = base + overlay - deletions, committed with the
-case's MR title/description as the commit message.
+case's MR title/description as the commit message. A case with `repo_config` is based on its own branch
+`base/<case_id>` = main + that text as `.nitless.yml`, since nitless reads the file at the base commit.
 
 A composed case (`compose: [case_id, ...]`) is one large MR: the overlays of its component cases
 applied together, plus its own overlay as filler (behaviour-preserving changes that must stay silent).
@@ -41,6 +42,7 @@ CaseKind = Literal[
     "clean",  # trap: good change, expect silence
     "nit-bait",  # trap: small change with only stylistic imperfections
     "composed",  # several cases in one large MR, plus silent filler (see `compose`)
+    "team-rule",  # violates a rule that only the repository's .nitless.yml states
 ]
 SILENT_KINDS = {"correct-here", "out-of-scope", "clean", "nit-bait"}
 
@@ -83,6 +85,7 @@ class CaseSpec(BaseModel):
     delete: list[str] = Field(default_factory=list)
     task: Task | None = None
     task_in_repo: bool = Field(default=False, description="commit the task as story.json instead of passing it")
+    repo_config: str = Field(default="", description=".nitless.yml committed to this case's base")
     expected: list[Expected] = Field(default_factory=list)
     forbidden: list[Anchor] = Field(default_factory=list, description="regions that must NOT be flagged")
     max_findings: int | None = Field(default=None, description="max findings allowed (default: len(expected))")
@@ -104,7 +107,13 @@ class CaseSpec(BaseModel):
             raise ValueError(f"{self.id}: {self.kind} cases need at least one expected finding")
         if self.kind in ("missing-ac", "out-of-scope") and not self.task:
             raise ValueError(f"{self.id}: {self.kind} cases need a task")
+        if (self.kind == "team-rule") != bool(self.repo_config):
+            raise ValueError(f"{self.id}: `repo_config` is required for, and only allowed in, team-rule cases")
         return self
+
+    @property
+    def base_ref(self) -> str:
+        return f"base/{self.id}" if self.repo_config else "main"
 
     @property
     def silent(self) -> bool:
@@ -182,7 +191,12 @@ def build_repo(repo: str) -> Path:
     _git(dest, "commit", "-q", "-m", "Initial import")
 
     for case in spec.cases:
-        _git(dest, "checkout", "-q", "-B", f"case/{case.id}", "main")
+        if case.repo_config:
+            _git(dest, "checkout", "-q", "-B", case.base_ref, "main")
+            (dest / ".nitless.yml").write_text(case.repo_config)
+            _git(dest, "add", "-A")
+            _git(dest, "commit", "-q", "-m", "Add .nitless.yml")
+        _git(dest, "checkout", "-q", "-B", f"case/{case.id}", case.base_ref)
         overlays = [src / "cases" / c.id for c in [*spec.components(case), case]]
         _check_disjoint(case.id, overlays)
         for overlay in overlays:
@@ -224,7 +238,7 @@ def validate_repo(repo: str) -> list[str]:
         if case.id in seen:
             problems.append(f"{case.id}: duplicate case id")
         seen.add(case.id)
-        files = {f.path: f for f in compute_diff(path, "main", f"case/{case.id}")}
+        files = {f.path: f for f in compute_diff(path, case.base_ref, f"case/{case.id}")}
         if not files:
             problems.append(f"{case.id}: branch has no changes")
         extra = [loc for e in case.expected for loc in e.also_at]

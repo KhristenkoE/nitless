@@ -6,10 +6,10 @@ acceptance criterion gets a status with evidence; unmet ones that map to a chang
 """
 
 import re
-from importlib import resources
 
 from pydantic import BaseModel, Field
 
+from nitless import prompts
 from nitless.context.intent import Intent
 from nitless.diff import FileDiff
 from nitless.llm import LLMClient
@@ -17,7 +17,6 @@ from nitless.models import ChangeRequest, Criterion, CriterionStatus, Evidence, 
 from nitless.review.naive import build_user_message
 from nitless.review.schema import CandidateFinding
 
-SYSTEM_PROMPT = resources.files("nitless.prompts").joinpath("requirements_system.md").read_text()
 MIN_FINDING_CONFIDENCE = {"not_met": 0.6, "partially_met": 0.75}  # a partial gap is a finding only when clear
 SEVERITY = {"not_met": "major", "partially_met": "minor"}
 DUPLICATE_LINE_SLACK = 5
@@ -52,7 +51,7 @@ def assess(llm: LLMClient, model: str, intent: Intent, change: ChangeRequest, fi
     if not intent.acceptance_criteria:
         task += "\n\nThe task lists no acceptance criteria: assess its intent as one criterion with id `intent`."
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": prompts.get("requirements_system")},
         {"role": "user", "content": build_user_message(change, files, profile, related, task=task)},
     ]
     return llm.call_tool(model, messages, "submit_requirements",

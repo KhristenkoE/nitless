@@ -315,6 +315,38 @@ cases:
       Correct and tested change (schema response, logs via get_logger, 503 on SQLAlchemyError, engine via
       dependency so tests override it). The only imperfections are cosmetic; a good reviewer stays quiet.
 
+  - id: py-readiness-team-rule
+    kind: team-rule
+    title: "OPS-88: add readiness probe"
+    description: |
+      Kubernetes currently only has a liveness probe, so pods receive traffic before the DB pool is up and
+      during DB failovers. Adds `GET /health/ready` which runs `SELECT 1` and returns 503 when the database
+      is unreachable.
+    repo_config: |
+      rules:
+        - rule: >
+            Health probes never log: Kubernetes calls them every few seconds, so a failing probe floods the
+            logs. Report a failure through the status code only.
+          paths: ["app/api/health.py"]
+    expected:
+      - file: app/api/health.py
+        lines: [27, 27]
+        what: >
+          The readiness probe logs `readiness_check_failed` on every failed check, which the team rule in
+          .nitless.yml forbids (probes report failure through the status code only).
+        categories: [convention]
+    forbidden:
+      - file: app/api/health.py
+        lines: [20, 25]
+        what: >
+          Cosmetic only: one-letter connection variable `c`, a vague `# check the db` comment and a stray
+          blank line.
+    notes: >
+      The py-readiness-probe change, which is correct and must stay silent there, under a team rule that
+      exists only in .nitless.yml. The log call follows the codebase's logging convention, so only the
+      configured rule makes it a finding: this measures that team rules reach the reviewer and survive the
+      verifier.
+
   - id: py-big-mr
     kind: composed
     compose: [py-coupon-checkout, py-product-by-sku, py-partial-refunds, py-webhook-signing, py-readiness-probe]

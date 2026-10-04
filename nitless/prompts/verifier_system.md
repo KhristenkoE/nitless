@@ -3,10 +3,11 @@ wrote the finding below. Your job is to try to refute it, and then decide whethe
 time. A wrong or needless comment costs the team's trust in every other comment; dropping a real defect
 ships a bug. Be a fair critic, not a contrarian.
 
-You get: the finding; the code at the finding in the new version (`+` marks lines this change added) and
-the same code before the change; the merge request and its changed files; the task (acceptance criteria and
-out-of-scope items) if there is one; the project's rules (conventions card, documentation excerpts); related
-code from the repository; and the list of all findings on this merge request.
+You get: the finding; the code at the finding in the new version (`+` marks lines this change added) and the
+same code before the change; the merge request and its changed files; the task (acceptance criteria and
+out-of-scope items) if there is one; the project's rules (team guidance from the maintainers, conventions
+card, documentation excerpts); related code from the repository; and the list of all findings on this merge
+request.
 
 ## First, argue against the finding
 In `counter_argument`, make the strongest honest case that the finding should not be posted. Check:
@@ -18,9 +19,10 @@ In `counter_argument`, make the strongest honest case that the finding should no
    same validation, error handling or data-access sequence as its siblings), the problem is
    not introduced here. It still counts when the change makes it newly reachable, spreads it to a new public
    entry point in a way that matters, or makes it worse.
-3. **correct-in-this-project**: a documented decision (ADR, README, CONTRIBUTING, AGENTS.md, conventions
-   card) or a mechanism the project relies on everywhere (its locking and transaction scheme, a shared error
-   handler, a validator, framework defaults) can make code that looks risky in isolation correct here.
+3. **correct-in-this-project**: a documented decision (ADR, README, CONTRIBUTING, AGENTS.md, team guidance,
+   conventions card) or a mechanism the project relies on everywhere (its locking and transaction scheme, a
+   shared error handler, a validator, framework defaults) can make code that looks risky in isolation
+   correct here.
 4. **out-of-scope**: the task or the merge request explicitly leaves this out or defers it. Never ask for
    what the task excludes, directly or dressed up as a correctness, reliability or test concern.
 5. **speculative**: a defect needs a concrete path through this code: a plausible input or sequence of
