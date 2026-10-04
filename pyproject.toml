@@ -1,6 +1,6 @@
 [project]
 name = "nitless"
-version = "0.2.0"
+version = "0.3.0"
 description = "AI code review for GitHub pull requests and GitLab merge requests: high-signal findings, no nitpicks"
 readme = "README.md"
 requires-python = ">=3.12"

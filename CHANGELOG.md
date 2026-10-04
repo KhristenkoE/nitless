@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 - Anthropic prompt caching for the system prompt and tool loops; cached tokens are counted and priced in `cost_usd`.
 - Re-runs build on the previous review (`INCREMENTAL`): the same head is published again without an LLM call, a new push reviews only the files changed since the reviewed head. The state is kept in the summary comment and signed with the API key.
