@@ -7,6 +7,7 @@ from typing import Any
 import anthropic
 
 from nitless.llm.base import (
+    OVERLOADED_STATUS,
     BackendError,
     Completion,
     ModelCheck,
@@ -56,6 +57,9 @@ class AnthropicBackend:
         except anthropic.AuthenticationError:
             raise BackendError("Anthropic rejected the API key (401)") from None
         except anthropic.APIStatusError as e:
+            if e.status_code in OVERLOADED_STATUS:
+                raise RateLimited(f"{model} is overloaded ({e.status_code}): {str(e.message)[:200]}",
+                                  _retry_after(e)) from None
             raise BackendError(f"Anthropic call to {model} failed ({e.status_code}): {str(e.message)[:300]}") from None
         except anthropic.APIError as e:
             raise BackendError(f"Anthropic call to {model} failed: {e}") from None

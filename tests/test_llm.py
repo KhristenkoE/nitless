@@ -1,6 +1,8 @@
 import json
 from types import SimpleNamespace
 
+import httpx
+import openai
 import pytest
 from pydantic import BaseModel
 
@@ -9,6 +11,7 @@ from nitless.errors import ConfigError, LLMError, QuotaExhaustedError
 from nitless.llm import LLMClient
 from nitless.llm.anthropic_api import AnthropicBackend, from_anthropic, to_anthropic
 from nitless.llm.base import (
+    BackendError,
     Completion,
     ModelCheck,
     RateLimited,
@@ -138,7 +141,7 @@ def test_rate_limits_are_waited_out_but_a_spent_quota_fails_fast(monkeypatch):
     assert slept == [7]
     with pytest.raises(QuotaExhaustedError, match="quota or credit exhausted"):
         client(FakeBackend(RateLimited("credit balance is too low", quota=True))).call_tool("m", [], "s", "A.", Answer)
-    with pytest.raises(LLMError, match="rate limit for m persisted"):
+    with pytest.raises(LLMError, match="still refused m after waiting up to 60s"):
         client(FakeBackend(RateLimited("slow down", retry_after_s=120))).call_tool("m", [], "s", "A.", Answer)
 
 
@@ -164,6 +167,30 @@ def test_gemini_per_minute_limits_are_waited_out_and_per_day_limits_are_a_quota(
     assert not is_quota(per_minute) and retry_delay_s(per_minute) == 41
     assert is_quota(GEMINI_429 % "GenerateRequestsPerDayPerProjectPerModel-FreeTier")
     assert is_quota("You exceeded your current quota, please check your plan and billing details.")  # OpenAI
+
+
+def test_an_overloaded_provider_is_waited_out_like_a_rate_limit():
+    def server_error(status):
+        request = httpx.Request("POST", "https://x/v1/chat/completions")
+        return openai.InternalServerError("high demand", response=httpx.Response(status, request=request), body=None)
+
+    def create(**params):
+        raise server_error(503)
+
+    backend = OpenAICompatBackend("gemini", "k", None, 1, 0)
+    backend._sdk = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    from nitless.llm.base import ToolSpec
+
+    with pytest.raises(RateLimited) as e:
+        backend.create("m", [], [ToolSpec("s", "", {})], None, 10)
+    assert not e.value.quota and "overloaded (503)" in str(e.value)
+
+    def create_500(**params):
+        raise server_error(500)
+
+    backend._sdk.chat.completions.create = create_500
+    with pytest.raises(BackendError, match=r"failed \(500\)"):
+        backend.create("m", [], [ToolSpec("s", "", {})], None, 10)
 
 
 # --- Anthropic ------------------------------------------------------------

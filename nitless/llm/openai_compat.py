@@ -5,6 +5,7 @@ from typing import Any
 import openai
 
 from nitless.llm.base import (
+    OVERLOADED_STATUS,
     BackendError,
     Completion,
     ModelCheck,
@@ -55,6 +56,9 @@ class OpenAICompatBackend:
         except openai.AuthenticationError:
             raise BackendError(f"{self.name} rejected the API key (401)") from None
         except openai.APIStatusError as e:
+            if e.status_code in OVERLOADED_STATUS:
+                raise RateLimited(f"{model} is overloaded ({e.status_code}): {str(e.message)[:200]}",
+                                  _retry_after(e)) from None
             if is_quota(str(e.message)):
                 raise RateLimited(f"{model}: {str(e.message)[:300]}", quota=True) from None
             raise BackendError(f"{self.name} call to {model} failed ({e.status_code}): {str(e.message)[:300]}") \

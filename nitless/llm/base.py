@@ -84,6 +84,10 @@ class Backend(Protocol):
         ...
 
 
+# Overloaded or temporarily unavailable: the provider asks to come back later, like a rate limit.
+OVERLOADED_STATUS = {503, 529}
+
+
 def is_quota(message: str) -> bool:
     if PER_DAY_RE.search(message):
         return True

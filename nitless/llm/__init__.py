@@ -140,7 +140,8 @@ class LLMClient:
                 raise QuotaExhaustedError(
                     f"{self.backend.name} quota or credit exhausted for {model}: {e}. Top up, wait for the reset, or "
                     "set MODEL_STRONG/MODEL_FAST to another model") from None
-            raise LLMError(f"{self.backend.name} rate limit for {model} persisted: {e}") from None
+            raise LLMError(f"{self.backend.name} still refused {model} after waiting up to "
+                           f"{self.settings.llm_rate_limit_wait_s:.0f}s (LLM_RATE_LIMIT_WAIT_S): {e}") from None
         except BackendError as e:
             raise LLMError(str(e)) from None
         self._record(model, response, self.usage)

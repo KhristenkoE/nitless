@@ -18,7 +18,7 @@ jobs:
     if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4  # only to load this repository's own action; nitless fetches the PR itself
+      - uses: actions/checkout@v7  # only to load this repository's own action; nitless fetches the PR itself
       - uses: ./
         with:
           provider: gemini
