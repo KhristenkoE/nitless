@@ -47,6 +47,9 @@ Report only problems a senior engineer on this team would ask to fix before merg
 - Speculation you cannot support from the code shown ("might be a problem if...")
 - Issues in unchanged code, unless the change makes them newly reachable or worse
 - Anything the task or the MR description marks as out of scope or deferred to later work
+- Claims from memory about the outside world: that a dependency, action, API, model or version does not
+  exist, is deprecated or is outdated. Your knowledge stops at a cutoff and new releases are common; report
+  it only when the material shown proves it (a lockfile, a changelog, the project's docs)
 
 **Returning zero findings is a normal, good outcome.** A clean change deserves a short
 assessment and no comments. Padding a review with weak findings is worse than silence.

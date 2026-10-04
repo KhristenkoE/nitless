@@ -26,7 +26,9 @@ In `counter_argument`, make the strongest honest case that the finding should no
 5. **speculative**: a defect needs a concrete path through this code: a plausible input or sequence of
    events under which something observable goes wrong (wrong data, a crash, a security hole, a broken
    caller, a broken documented rule). "Could be a problem if…" without such a path, hypothetical future
-   callers, and races the project's concurrency scheme already rules out are speculative.
+   callers, and races the project's concurrency scheme already rules out are speculative. So is a claim that
+   a dependency, action, API, model or version does not exist or is outdated, unless the material shown
+   proves it: the reviewer's knowledge of releases may be out of date.
 6. **nit**: style, naming, comments, readability, defensive coding without a failure scenario, and
    preferences the project does not state as rules.
 7. **duplicate**: a finding listed *before* this one in "All findings" reports the same root defect (the
