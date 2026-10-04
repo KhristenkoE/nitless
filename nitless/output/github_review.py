@@ -13,12 +13,20 @@ from nitless.models import ChangeRequest, Finding, ReviewResult
 from nitless.output.base import OutputAdapter
 from nitless.output.gitlab_notes import FINGERPRINT_RE, SUMMARY_MARKER, fingerprint
 from nitless.output.markdown import render, render_finding
-from nitless.scm.github import API_HEADERS, is_pr_url, parse_pr_url
+from nitless.output.stale import can_clear, is_stale, resolved_body
+from nitless.scm.github import API_HEADERS, PullRequestRef, is_pr_url, parse_pr_url
 
 log = logging.getLogger(__name__)
 
 DRY_RUN_FILE = "github-comments.json"
 NEXT_PAGE_RE = re.compile(r'<[^>]*[?&]page=(\d+)[^>]*>;\s*rel="next"')
+# REST cannot resolve a review thread; GraphQL can, given the thread id of the comment.
+THREADS_QUERY = """query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) { pullRequest(number: $number) {
+    reviewThreads(first: 100, after: $cursor) {
+      nodes { id isResolved comments(first: 1) { nodes { databaseId } } }
+      pageInfo { hasNextPage endCursor } } } } }"""
+RESOLVE_MUTATION = "mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { id } } }"
 
 
 class GitHubReviewAdapter(OutputAdapter):
@@ -26,7 +34,8 @@ class GitHubReviewAdapter(OutputAdapter):
 
     Existing comments are read first: a finding whose fingerprint is already there is skipped and the
     summary comment is updated in place. A finding GitHub cannot place (422: the line is not part of the
-    diff) is listed in the summary instead. Failed runs are never posted (`publishes_errors`).
+    diff) is listed in the summary instead. A comment from an earlier run whose finding is gone is resolved
+    (see `nitless.output.stale`). Failed runs are never posted (`publishes_errors`).
     """
 
     name = "github"
@@ -80,6 +89,9 @@ class GitHubReviewAdapter(OutputAdapter):
             else:
                 inline.add(f.id)
 
+        current = {fingerprint(f) for f in result.findings}
+        cleared = self._clear_stale(ref, review_comments, current, result, change, planned if dry_run else None)
+
         body = render(result, change, inline=inline).rstrip()
         if summary_id is not None:
             body += f"\n\n_Updated for {change.head_sha[:8]}._"
@@ -91,12 +103,79 @@ class GitHubReviewAdapter(OutputAdapter):
             out = self._dry_run_path()
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(planned, indent=2, ensure_ascii=False) + "\n")
-            log.info("dry run: %d review comments and 1 summary comment written to %s, nothing posted",
+            log.info("dry run: %d requests for review comments and 1 for the summary written to %s, nothing posted",
                      len(planned) - 1, out)
             return
         self._request(method, path, {"body": body})
-        log.info("github: %d review comments posted, %d already present, %d outside the diff listed in the summary; "
-                 "summary comment %s", len(inline) - skipped, skipped, outside, "updated" if summary_id else "created")
+        log.info("github: %d review comments posted, %d already present, %d outside the diff listed in the summary, "
+                 "%d stale %s; summary comment %s", len(inline) - skipped, skipped, outside, cleared,
+                 "deleted or resolved" if self.settings.stale_comments == "delete" else "resolved",
+                 "updated" if summary_id else "created")
+
+    def _clear_stale(self, ref: PullRequestRef, review_comments: list[dict], current: set[str],
+                     result: ReviewResult, change: ChangeRequest, planned: list[dict] | None) -> int:
+        """Resolve (or delete) this tool's earlier comments whose finding is gone; `planned` set: dry run."""
+        mode = self.settings.stale_comments
+        if mode == "keep" or not can_clear(result):
+            return 0
+        replied = {c["in_reply_to_id"] for c in review_comments if c.get("in_reply_to_id")}
+        cleared, to_resolve = 0, []
+        for c in review_comments:
+            m = FINGERPRINT_RE.search(c.get("body") or "")
+            if c.get("in_reply_to_id") or not m or not is_stale(m[1], c.get("path"), current, result):
+                continue
+            path = f"/repos/{ref.owner}/{ref.repo}/pulls/comments/{c['id']}"
+            if mode == "delete" and c["id"] not in replied:
+                method, payload = "DELETE", None
+            else:
+                method, payload = "PATCH", {"body": resolved_body(c["body"], m[1], change.head_sha)}
+                to_resolve.append(c["id"])
+            if planned is not None:
+                planned.append({"method": method, "path": path, "json": payload})
+            elif (status := self._request(method, path, payload, tolerate=(403, 404)).status_code) in (403, 404):
+                log.warning("github: cannot %s stale comment %s (%d), left as is",
+                            method.lower(), c["id"], status)
+                to_resolve = [i for i in to_resolve if i != c["id"]]
+                continue
+            cleared += 1
+        if to_resolve:
+            if planned is not None:
+                planned.append({"method": "POST", "path": "graphql", "json": {"resolveReviewThread": to_resolve}})
+            else:
+                self._resolve_threads(ref, set(to_resolve))
+        return cleared
+
+    def _resolve_threads(self, ref: PullRequestRef, comment_ids: set[int]) -> None:
+        """Mark the threads that start with these comments resolved; best effort, the edit already says it."""
+        url = ref.api_url.removesuffix("/v3") + "/graphql"  # api.github.com/graphql, <host>/api/graphql
+        variables: dict = {"owner": ref.owner, "repo": ref.repo, "number": ref.number, "cursor": None}
+        threads: list[str] = []
+        while True:
+            data = self._graphql(url, THREADS_QUERY, variables)
+            if data is None:
+                return
+            conn = data["repository"]["pullRequest"]["reviewThreads"]
+            threads += [t["id"] for t in conn["nodes"] if not t["isResolved"]
+                        and any(c["databaseId"] in comment_ids for c in t["comments"]["nodes"])]
+            if not conn["pageInfo"]["hasNextPage"]:
+                break
+            variables["cursor"] = conn["pageInfo"]["endCursor"]
+        for thread in threads:
+            if self._graphql(url, RESOLVE_MUTATION, {"id": thread}) is None:
+                return
+
+    def _graphql(self, url: str, query: str, variables: dict) -> dict | None:
+        try:
+            resp = self._http.post(url, json={"query": query, "variables": variables})
+            data = resp.json() if not resp.is_error else None
+        except (httpx.HTTPError, ValueError) as e:
+            log.warning("github: cannot resolve stale threads: %s", e)
+            return None
+        if data is None or data.get("errors") or not data.get("data"):
+            detail = (data or {}).get("errors") or f"HTTP {resp.status_code}"
+            log.warning("github: cannot resolve stale threads: %s", str(detail)[:200])
+            return None
+        return data["data"]
 
     def _dry_run_path(self) -> Path:
         out = self.settings.output_file

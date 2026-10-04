@@ -14,6 +14,7 @@ from nitless.errors import ConfigError, PublishError
 from nitless.models import ChangeRequest, Finding, ReviewResult
 from nitless.output.base import OutputAdapter
 from nitless.output.markdown import render, render_finding
+from nitless.output.stale import can_clear, is_stale, resolved_body
 from nitless.scm.gitlab import parse_mr_url
 
 log = logging.getLogger(__name__)
@@ -33,7 +34,8 @@ class GitLabNotesAdapter(OutputAdapter):
 
     Existing notes are read first: a finding whose fingerprint is already there is skipped and the
     summary note is updated in place. A finding GitLab cannot place (400: the line is not part of the
-    diff) is listed in the summary instead. Failed runs are never posted (`publishes_errors`).
+    diff) is listed in the summary instead. A discussion from an earlier run whose finding is gone is resolved
+    (see `nitless.output.stale`). Failed runs are never posted (`publishes_errors`).
     """
 
     name = "gitlab"
@@ -61,8 +63,9 @@ class GitLabNotesAdapter(OutputAdapter):
         planned: list[dict] = []  # dry run: the requests that were not sent
 
         notes = self._list(f"{mr}/notes")
+        discussions = self._list(f"{mr}/discussions")
         bodies = [n["body"] for n in notes]
-        bodies += [n["body"] for d in self._list(f"{mr}/discussions") for n in d.get("notes", [])]
+        bodies += [n["body"] for d in discussions for n in d.get("notes", [])]
         present = {fp for body in bodies for fp in FINGERPRINT_RE.findall(body)}
         summary_id = next((n["id"] for n in notes if SUMMARY_MARKER in n["body"]), None)
 
@@ -84,6 +87,9 @@ class GitLabNotesAdapter(OutputAdapter):
             else:
                 inline.add(f.id)
 
+        current = {fingerprint(f) for f in result.findings}
+        cleared = self._clear_stale(mr, discussions, current, result, change, planned if dry_run else None)
+
         body = render(result, change, inline=inline).rstrip()
         if summary_id is not None:
             body += f"\n\n_Updated for {change.head_sha[:8]}._"
@@ -94,11 +100,45 @@ class GitLabNotesAdapter(OutputAdapter):
             out = self._dry_run_path()
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(planned, indent=2, ensure_ascii=False) + "\n")
-            log.info("dry run: %d inline notes and 1 summary note written to %s, nothing posted", len(planned) - 1, out)
+            log.info("dry run: %d requests for inline notes and 1 for the summary written to %s, nothing posted",
+                     len(planned) - 1, out)
             return
         self._request(method, path, {"body": body})
-        log.info("gitlab: %d inline notes posted, %d already present, %d outside the diff listed in the summary; "
-                 "summary note %s", len(inline) - skipped, skipped, outside, "updated" if summary_id else "created")
+        log.info("gitlab: %d inline notes posted, %d already present, %d outside the diff listed in the summary, "
+                 "%d stale %s; summary note %s", len(inline) - skipped, skipped, outside, cleared,
+                 "deleted or resolved" if self.settings.stale_comments == "delete" else "resolved",
+                 "updated" if summary_id else "created")
+
+    def _clear_stale(self, mr: str, discussions: list[dict], current: set[str], result: ReviewResult,
+                     change: ChangeRequest, planned: list[dict] | None) -> int:
+        """Resolve (or delete) this tool's earlier discussions whose finding is gone; `planned` set: dry run."""
+        mode = self.settings.stale_comments
+        if mode == "keep" or not can_clear(result):
+            return 0
+        cleared = 0
+        for d in discussions:
+            notes = [n for n in d.get("notes", []) if not n.get("system")]
+            first = notes[0] if notes else {}
+            m = FINGERPRINT_RE.search(first.get("body") or "")
+            file = (first.get("position") or {}).get("new_path")
+            if not m or not is_stale(m[1], file, current, result):
+                continue
+            note = f"{mr}/discussions/{d['id']}/notes/{first['id']}"
+            if mode == "delete" and len(notes) == 1:
+                requests = [("DELETE", note, None)]
+            else:
+                requests = [("PUT", note, {"body": resolved_body(first["body"], m[1], change.head_sha)})]
+                if first.get("resolvable") and not first.get("resolved"):
+                    requests.append(("PUT", f"{mr}/discussions/{d['id']}", {"resolved": True}))
+            for method, path, payload in requests:
+                if planned is not None:
+                    planned.append({"method": method, "path": path, "json": payload})
+                elif (status := self._request(method, path, payload, tolerate=(403, 404)).status_code) in (403, 404):
+                    log.warning("gitlab: cannot update stale discussion %s (%d), left as is", d["id"], status)
+                    break
+            else:
+                cleared += 1
+        return cleared
 
     def _dry_run_path(self) -> Path:
         out = self.settings.output_file

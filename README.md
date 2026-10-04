@@ -74,7 +74,9 @@ docker run --rm \
 ```
 
 This posts one comment per finding on its line, plus a summary comment. Re-running is safe: the summary is
-updated in place and existing findings are not posted twice.
+updated in place and existing findings are not posted twice. A comment whose finding a later review no longer
+reports is resolved: its thread is marked resolved and the text is collapsed under "No longer found". Partial
+reviews and skipped files never resolve anything.
 
 ### Other ways to run it
 
@@ -255,14 +257,15 @@ touches, else the PR or MR description.
 **Output and runtime**
 
 
-| Variable                            | Default  | Meaning                                     |
-| ----------------------------------- | -------- | ------------------------------------------- |
-| `OUTPUT_ADAPTER`                    | `json`   | `json`, `markdown`, `github`, `gitlab`      |
-| `OUTPUT_FILE`                       | stdout   | `json` adapter target                       |
-| `MARKDOWN_FILE`                     | stdout   | `markdown` adapter target                   |
-| `GITHUB_DRY_RUN` / `GITLAB_DRY_RUN` | `off`    | write requests to a file instead of posting |
-| `WORKDIR`                           | temp dir | keep the checkout here                      |
-| `LOG_LEVEL`                         | `INFO`   | logs go to stderr                           |
+| Variable                            | Default   | Meaning                                                                         |
+| ----------------------------------- | --------- | ------------------------------------------------------------------------------- |
+| `OUTPUT_ADAPTER`                    | `json`    | `json`, `markdown`, `github`, `gitlab`                                          |
+| `OUTPUT_FILE`                       | stdout    | `json` adapter target                                                           |
+| `MARKDOWN_FILE`                     | stdout    | `markdown` adapter target                                                       |
+| `GITHUB_DRY_RUN` / `GITLAB_DRY_RUN` | `off`     | write requests to a file instead of posting                                     |
+| `STALE_COMMENTS`                    | `resolve` | earlier comments no longer found: `resolve`, `delete` (unanswered ones), `keep` |
+| `WORKDIR`                           | temp dir  | keep the checkout here                                                          |
+| `LOG_LEVEL`                         | `INFO`    | logs go to stderr                                                               |
 
 
 

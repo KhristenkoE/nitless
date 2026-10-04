@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Comments from earlier runs whose finding is gone are resolved (`STALE_COMMENTS=resolve|delete|keep`).
+
 ## 0.2.0
 
 - GitHub Action (`uses: KhristenkoE/nitless@v0`): reviews every pull request, with `fail-on`, dry run and outputs.

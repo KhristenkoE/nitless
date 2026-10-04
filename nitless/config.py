@@ -88,6 +88,8 @@ class Settings(BaseSettings):
     markdown_file: Path | None = None  # markdown adapter; stdout when unset
     gitlab_dry_run: bool = False  # GITLAB_DRY_RUN=on|off: the gitlab adapter writes its requests to a file instead
     github_dry_run: bool = False  # GITHUB_DRY_RUN=on|off: the same for the github adapter
+    # inline comments of earlier runs that this run no longer reports: resolve them, delete them, or leave them
+    stale_comments: Literal["resolve", "delete", "keep"] = "resolve"
 
     # --- runtime ----------------------------------------------------------
     workdir: Path | None = None

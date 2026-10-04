@@ -8,6 +8,7 @@ from nitless.config import load_settings
 from nitless.errors import ConfigError, PublishError
 from nitless.models import ChangeRequest, ReviewResult
 from nitless.output.github_review import SUMMARY_MARKER, GitHubReviewAdapter, fingerprint
+from nitless.output.stale import resolved_body
 
 FIXTURES = Path(__file__).parent / "fixtures"
 PR_URL = "https://github.com/octo/widgets/pull/12"
@@ -19,7 +20,7 @@ ISSUE_COMMENTS, REVIEW_COMMENTS = f"{REPO}/issues/12/comments", f"{REPO}/pulls/1
 def clean_env(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)  # no stray .env
     for var in ("MR_URL", "LOCAL_REPO", "GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "ANTHROPIC_API_KEY",
-                "OUTPUT_ADAPTER", "GITHUB_DRY_RUN"):
+                "OUTPUT_ADAPTER", "GITHUB_DRY_RUN", "STALE_COMMENTS"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
     monkeypatch.setenv("MODEL_STRONG", "m")
@@ -37,15 +38,24 @@ def change() -> ChangeRequest:
 
 
 class FakeGitHub:
-    """Records every request; answers GETs from `comments` and `review_comments`, POST/PATCH with `status`."""
+    """Records every request; answers GETs from `comments` and `review_comments`, POST/PATCH with `status`,
+    GraphQL from `threads` ({thread id: first comment id})."""
 
-    def __init__(self, comments=(), review_comments=(), status=201, reject_lines=()):
+    def __init__(self, comments=(), review_comments=(), status=201, reject_lines=(), threads=None):
         self.comments, self.review_comments = list(comments), list(review_comments)
-        self.status, self.reject_lines = status, reject_lines
+        self.status, self.reject_lines, self.threads = status, reject_lines, threads or {}
         self.requests: list[httpx.Request] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
+        if request.url.path == "/graphql":
+            query = json.loads(request.content)["query"]
+            if "resolveReviewThread" in query:
+                return httpx.Response(200, json={"data": {"resolveReviewThread": {"thread": {"id": "t"}}}})
+            nodes = [{"id": t, "isResolved": False, "comments": {"nodes": [{"databaseId": c}]}}
+                     for t, c in self.threads.items()]
+            return httpx.Response(200, json={"data": {"repository": {"pullRequest": {"reviewThreads": {
+                "nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}})
         if request.method == "GET":
             assert request.url.params["per_page"] == "100"
             items = self.comments if request.url.path == ISSUE_COMMENTS else self.review_comments
@@ -184,3 +194,99 @@ def test_gh_token_is_an_alias(monkeypatch):
     monkeypatch.setenv("GH_TOKEN", "ghp_alias")
     settings = load_settings(mr_url=PR_URL, output_adapter="github")
     assert settings.github_token.get_secret_value() == "ghp_alias"
+
+
+STALE_FP = "0123456789ab"  # matches no finding of the fixture
+
+
+def stale_comments():
+    return [{"id": 40, "path": "app/services/payments.py", "body": f"old finding\n\n<!-- nitless:fp={STALE_FP} -->"},
+            {"id": 41, "path": "app/x.py", "body": "<!-- nitless:fp=aaaaaaaaaaaa -->"},
+            {"id": 42, "path": "app/x.py", "body": "I fixed it", "in_reply_to_id": 41},
+            {"id": 43, "path": "app/y.py", "body": "a human comment"}]
+
+
+def test_stale_comments_are_rewritten_and_their_threads_resolved(result, change, tmp_path):
+    server = FakeGitHub(review_comments=stale_comments(), threads={"T40": 40, "T41": 41, "T43": 43})
+    adapter(server, tmp_path).publish(result, change)
+
+    patches = [r for r in server.sent("PATCH") if "/pulls/comments/" in r.url.path]
+    assert [r.url.path for r in patches] == [f"{REPO}/pulls/comments/40", f"{REPO}/pulls/comments/41"]
+    body = json.loads(patches[0].content)["body"]
+    assert body.startswith("✅ No longer found as of 01234567.")
+    assert "old finding" in body and "nitless:fp=" not in body
+    assert body.endswith(f"<!-- nitless:resolved={STALE_FP} -->")
+    resolved = [json.loads(r.content)["variables"]["id"] for r in server.requests
+                if r.url.path == "/graphql" and "resolveReviewThread" in json.loads(r.content)["query"]]
+    assert resolved == ["T40", "T41"]
+    assert not server.sent("DELETE")
+
+
+def test_delete_mode_deletes_unanswered_comments_and_resolves_answered_ones(result, change, tmp_path):
+    server = FakeGitHub(review_comments=stale_comments(), threads={"T41": 41})
+    adapter(server, tmp_path, stale_comments="delete").publish(result, change)
+
+    assert [r.url.path for r in server.sent("DELETE")] == [f"{REPO}/pulls/comments/40"]
+    assert [r.url.path for r in server.sent("PATCH") if "/pulls/" in r.url.path] == [f"{REPO}/pulls/comments/41"]
+
+
+@pytest.mark.parametrize("case", ["partial", "keep", "skipped"])
+def test_stale_comments_stay_when_the_run_cannot_tell(case, result, change, tmp_path):
+    overrides = {"stale_comments": "keep"} if case == "keep" else {}
+    if case == "partial":
+        result = result.model_copy(update={"status": "partial"})
+    if case == "skipped":
+        result = result.model_copy(update={"skipped_files": ["app/services/payments.py", "app/x.py"]})
+    server = FakeGitHub(review_comments=stale_comments())
+    adapter(server, tmp_path, **overrides).publish(result, change)
+
+    assert not server.sent("DELETE")
+    assert not [r for r in server.requests if "/pulls/comments/" in r.url.path or r.url.path == "/graphql"]
+
+
+def test_a_comment_nitless_cannot_edit_is_left_and_the_run_goes_on(result, change, tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH" and "/pulls/comments/" in request.url.path:
+            return httpx.Response(403, json={"message": "Must have admin rights"})
+        return server(request)
+
+    server = FakeGitHub(review_comments=stale_comments()[:1])
+    settings = load_settings(mr_url=PR_URL, github_token="ghp_x", output_adapter="github")
+    GitHubReviewAdapter(settings, transport=httpx.MockTransport(handler)).publish(result, change)
+
+    assert not [r for r in server.requests if r.url.path == "/graphql"]
+    assert server.sent("POST")[-1].url.path == ISSUE_COMMENTS  # the summary is still posted
+
+
+def test_failed_thread_lookup_is_only_a_warning(result, change, tmp_path, caplog):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/graphql":
+            return httpx.Response(200, json={"errors": [{"message": "Resource not accessible by integration"}]})
+        return server(request)
+
+    server = FakeGitHub(review_comments=stale_comments()[:1])
+    settings = load_settings(mr_url=PR_URL, github_token="ghp_x", output_adapter="github")
+    GitHubReviewAdapter(settings, transport=httpx.MockTransport(handler)).publish(result, change)
+
+    assert "cannot resolve stale threads" in caplog.text
+    assert server.sent("POST")[-1].url.path == ISSUE_COMMENTS
+
+
+def test_dry_run_plans_the_stale_cleanup(result, change, tmp_path):
+    server = FakeGitHub(review_comments=stale_comments())
+    adapter(server, tmp_path, github_dry_run="on").publish(result, change)
+
+    assert {r.method for r in server.requests} == {"GET"}
+    plan = json.loads((tmp_path / "out" / "github-comments.json").read_text())
+    assert [(p["method"], p["path"]) for p in plan[3:-1]] == [
+        ("PATCH", f"{REPO}/pulls/comments/40"), ("PATCH", f"{REPO}/pulls/comments/41"), ("POST", "graphql")]
+
+
+def test_a_resolved_comment_does_not_hide_a_finding_that_comes_back(result, change, tmp_path):
+    fp = fingerprint(result.findings[0])
+    old = resolved_body(f"x\n\n<!-- nitless:fp={fp} -->", fp, "f" * 40)
+    server = FakeGitHub(review_comments=[{"id": 40, "path": result.findings[0].file, "body": old}])
+    adapter(server, tmp_path).publish(result, change)
+
+    assert [r.url.path for r in server.sent("POST")] == [REVIEW_COMMENTS] * 3 + [ISSUE_COMMENTS]
+    assert not server.sent("PATCH")

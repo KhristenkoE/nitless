@@ -17,7 +17,8 @@ MR_PATH = "/projects/group%2Fproj/merge_requests/7"  # relative to <base_url>/ap
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)  # no stray .env
-    for var in ("MR_URL", "LOCAL_REPO", "GITLAB_TOKEN", "ANTHROPIC_API_KEY", "OUTPUT_ADAPTER", "GITLAB_DRY_RUN"):
+    for var in ("MR_URL", "LOCAL_REPO", "GITLAB_TOKEN", "ANTHROPIC_API_KEY", "OUTPUT_ADAPTER", "GITLAB_DRY_RUN",
+                "STALE_COMMENTS"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
     monkeypatch.setenv("MODEL_STRONG", "m")
@@ -169,3 +170,42 @@ def test_validate_needs_mr_url_and_token(tmp_path):
     with pytest.raises(ConfigError, match="GITLAB_TOKEN with the api scope"):
         GitLabNotesAdapter(no_token).validate()
     GitLabNotesAdapter(load_settings(mr_url=MR_URL, gitlab_token="t", output_adapter="gitlab")).validate()
+
+
+def stale_discussions():
+    note = {"id": 70, "body": "old finding\n\n<!-- nitless:fp=0123456789ab -->", "resolvable": True,
+            "resolved": False, "position": {"new_path": "app/services/payments.py"}}
+    answered = {"id": 80, "body": "<!-- nitless:fp=aaaaaaaaaaaa -->", "resolvable": True, "resolved": False,
+                "position": {"new_path": "app/x.py"}}
+    return [{"id": "d1", "notes": [note]},
+            {"id": "d2", "notes": [answered, {"id": 81, "body": "fixed", "system": False}]},
+            {"id": "d3", "notes": [{"id": 90, "body": "a human thread"}]}]
+
+
+def test_stale_discussions_are_rewritten_and_resolved(result, change, tmp_path):
+    server = FakeGitLab(discussions=stale_discussions())
+    adapter(server, tmp_path).publish(result, change)
+
+    puts = [(path(r), json.loads(r.content)) for r in server.sent("PUT")]
+    assert [p for p, _ in puts] == [f"/api/v4{MR_PATH}/discussions/d1/notes/70", f"/api/v4{MR_PATH}/discussions/d1",
+                                    f"/api/v4{MR_PATH}/discussions/d2/notes/80", f"/api/v4{MR_PATH}/discussions/d2"]
+    assert puts[0][1]["body"].startswith("✅ No longer found as of 01234567.")
+    assert puts[0][1]["body"].endswith("<!-- nitless:resolved=0123456789ab -->")
+    assert puts[1][1] == {"resolved": True}
+    assert not server.sent("DELETE")
+
+
+def test_delete_mode_deletes_unanswered_discussions(result, change, tmp_path):
+    server = FakeGitLab(discussions=stale_discussions())
+    adapter(server, tmp_path, stale_comments="delete").publish(result, change)
+
+    assert [path(r) for r in server.sent("DELETE")] == [f"/api/v4{MR_PATH}/discussions/d1/notes/70"]
+    assert [path(r) for r in server.sent("PUT")] == [f"/api/v4{MR_PATH}/discussions/d2/notes/80",
+                                                     f"/api/v4{MR_PATH}/discussions/d2"]
+
+
+def test_partial_run_leaves_stale_discussions(result, change, tmp_path):
+    server = FakeGitLab(discussions=stale_discussions())
+    adapter(server, tmp_path).publish(result.model_copy(update={"status": "partial"}), change)
+
+    assert not server.sent("PUT") and not server.sent("DELETE")
