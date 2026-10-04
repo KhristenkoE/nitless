@@ -1,0 +1,27 @@
+name: Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  nitless:
+    # Pull requests from forks get no secrets; skip them rather than fail.
+    if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4  # only to load this repository's own action; nitless fetches the PR itself
+      - uses: ./
+        with:
+          provider: gemini
+          api-key: ${{ secrets.GEMINI_API_KEY }}
+          model: gemini-3.6-flash
+          fast-model: gemini-3.5-flash-lite

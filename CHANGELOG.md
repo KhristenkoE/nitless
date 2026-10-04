@@ -2,6 +2,7 @@
 
 ## 0.2.0
 
+- GitHub Action (`uses: KhristenkoE/nitless@v0`): reviews every pull request, with `fail-on`, dry run and outputs.
 - Any LLM provider: Anthropic through its own SDK, and OpenAI, Gemini, GitHub Models, OpenRouter, Ollama or any chat-completions server through `LLM_PROVIDER` and `LLM_BASE_URL`.
 - Cost from list prices, with `MODEL_PRICES` for models without a built-in price.
 - A spent quota or credit on any provider fails fast with exit code 7; per-minute limits are waited out.

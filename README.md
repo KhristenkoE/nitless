@@ -8,6 +8,57 @@ Works with Anthropic, OpenAI, Gemini, GitHub Models, OpenRouter, Ollama or any O
 
 ## Quick start
 
+### GitHub Action
+
+Add the provider key as a repository secret, then `.github/workflows/review.yml`:
+
+```yaml
+name: Review
+on:
+  pull_request:
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  nitless:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: KhristenkoE/nitless@v0
+        with:
+          provider: anthropic
+          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: <model>
+```
+
+Every pull request gets a review: one comment per finding on its line, plus a summary comment, also shown in
+the job summary. Pushing more commits re-runs it; the summary is updated in place and existing findings are not
+posted twice. Pull requests from forks get no secrets, so add
+`if: github.event.pull_request.head.repo.full_name == github.repository` to skip them.
+
+<details><summary>Action inputs and outputs</summary>
+
+| Input              | Default                    |                                                                         |
+| ------------------ | -------------------------- | ----------------------------------------------------------------------- |
+| `provider`         | required                   | `anthropic`, `openai`, `gemini`, `github`, `openrouter`, `openai_compat` |
+| `api-key`          |                            | the provider key, from a secret                                         |
+| `model`            | required                   | review model                                                            |
+| `fast-model`       | `model`                    | task extraction and conventions                                         |
+| `verifier-model`   | `model`                    | checks every finding                                                    |
+| `base-url`         |                            | a proxy or self-hosted endpoint                                         |
+| `fail-on`          | `never`                    | fail the step on a finding at or above `critical`, `major` or `minor`   |
+| `dry-run`          | `false`                    | write the planned comments to the job summary instead of posting        |
+| `env`              |                            | more settings, one `KEY=VALUE` per line (see [Configuration](#configuration)) |
+| `github-token`     | `${{ github.token }}`      | reads the pull request and posts the review                             |
+| `pull-request-url` | the triggering PR          | review another pull request                                             |
+
+Outputs: `verdict` (`no_issues`, `minor_issues`, `needs_changes`; empty when the run failed), `findings` (the
+number published) and `result` (path to the JSON result). A failed run fails the step with the
+[exit code](#exit-codes).
+
+</details>
+
+### Docker
+
 You need Docker, an LLM API key, a model name and a GitHub token with pull request write access.
 
 ```bash

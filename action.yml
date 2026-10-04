@@ -1,0 +1,77 @@
+name: nitless
+description: AI code review that reads the project, not just the diff. Posts grounded findings on the pull request.
+author: Eugene Khristenko
+branding:
+  icon: check-circle
+  color: green
+
+inputs:
+  api-key:
+    description: API key of the LLM provider (pass a secret). Not needed for a keyless openai_compat server.
+    required: false
+  provider:
+    description: anthropic, openai, gemini, github (GitHub Models), openrouter or openai_compat.
+    required: true
+  model:
+    description: Model for review (MODEL_STRONG).
+    required: true
+  fast-model:
+    description: Model for task extraction and conventions. Defaults to `model`.
+    required: false
+  verifier-model:
+    description: Model that checks every finding. Defaults to `model`.
+    required: false
+  base-url:
+    description: Endpoint for a proxy, a self-hosted server or openai_compat.
+    required: false
+  github-token:
+    description: Token that reads the pull request and posts the review.
+    required: false
+    default: ${{ github.token }}
+  pull-request-url:
+    description: The pull request to review. Defaults to the one that triggered the workflow.
+    required: false
+    default: ${{ github.event.pull_request.html_url }}
+  fail-on:
+    description: Fail the step when a finding at or above this severity is posted (critical, major, minor), or `never`.
+    required: false
+    default: never
+  dry-run:
+    description: "`true` writes the planned comments to the job summary instead of posting them."
+    required: false
+    default: "false"
+  env:
+    description: More nitless settings, one KEY=VALUE per line (e.g. SEVERITY_FLOOR=major, PATH_EXCLUDES=docs/).
+    required: false
+
+outputs:
+  verdict:
+    description: no_issues, minor_issues or needs_changes (empty when the run failed).
+    value: ${{ steps.review.outputs.verdict }}
+  findings:
+    description: Number of published findings.
+    value: ${{ steps.review.outputs.findings }}
+  result:
+    description: Path to the JSON result.
+    value: ${{ steps.review.outputs.result }}
+
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@v6
+
+    - id: review
+      shell: bash
+      env:
+        MR_URL: ${{ inputs.pull-request-url }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        LLM_PROVIDER: ${{ inputs.provider }}
+        LLM_API_KEY: ${{ inputs.api-key }}
+        LLM_BASE_URL: ${{ inputs.base-url }}
+        MODEL_STRONG: ${{ inputs.model }}
+        MODEL_FAST: ${{ inputs.fast-model }}
+        MODEL_VERIFIER: ${{ inputs.verifier-model }}
+        GITHUB_DRY_RUN: ${{ inputs.dry-run == 'true' && 'on' || 'off' }}
+        NITLESS_FAIL_ON: ${{ inputs.fail-on }}
+        NITLESS_EXTRA_ENV: ${{ inputs.env }}
+      run: '"$GITHUB_ACTION_PATH/scripts/action.sh"'
