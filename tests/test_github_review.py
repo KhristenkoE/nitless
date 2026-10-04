@@ -268,7 +268,7 @@ def test_failed_thread_lookup_is_only_a_warning(result, change, tmp_path, caplog
     settings = load_settings(mr_url=PR_URL, github_token="ghp_x", output_adapter="github")
     GitHubReviewAdapter(settings, transport=httpx.MockTransport(handler)).publish(result, change)
 
-    assert "cannot resolve stale threads" in caplog.text
+    assert "threads stay open" in caplog.text
     assert server.sent("POST")[-1].url.path == ISSUE_COMMENTS
 
 

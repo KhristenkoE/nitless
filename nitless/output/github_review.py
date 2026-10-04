@@ -169,11 +169,11 @@ class GitHubReviewAdapter(OutputAdapter):
             resp = self._http.post(url, json={"query": query, "variables": variables})
             data = resp.json() if not resp.is_error else None
         except (httpx.HTTPError, ValueError) as e:
-            log.warning("github: cannot resolve stale threads: %s", e)
+            log.warning("github: stale comments rewritten, but their threads stay open: %s", e)
             return None
         if data is None or data.get("errors") or not data.get("data"):
             detail = (data or {}).get("errors") or f"HTTP {resp.status_code}"
-            log.warning("github: cannot resolve stale threads: %s", str(detail)[:200])
+            log.warning("github: stale comments rewritten, but their threads stay open: %s", str(detail)[:200])
             return None
         return data["data"]
 
