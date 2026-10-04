@@ -13,6 +13,7 @@ from nitless.llm.base import (
     ToolChoiceRejected,
     ToolSpec,
     is_quota,
+    retry_delay_s,
 )
 
 
@@ -40,7 +41,8 @@ class OpenAICompatBackend:
             response = self._sdk.chat.completions.create(**params)
         except openai.RateLimitError as e:
             body = f"{e.message} {e.body}"
-            raise RateLimited(f"{model}: {str(e.message)[:300]}", _retry_after(e), quota=is_quota(body)) from None
+            retry = _retry_after(e) or retry_delay_s(body)
+            raise RateLimited(f"{model}: {str(e.message)[:300]}", retry, quota=is_quota(body)) from None
         except openai.BadRequestError as e:
             text = str(e.message)
             if force and "tool_choice" in text:

@@ -8,7 +8,15 @@ from nitless.config import Settings, load_settings
 from nitless.errors import ConfigError, LLMError, QuotaExhaustedError
 from nitless.llm import LLMClient
 from nitless.llm.anthropic_api import AnthropicBackend, from_anthropic, to_anthropic
-from nitless.llm.base import Completion, ModelCheck, RateLimited, ToolCall, ToolChoiceRejected, is_quota
+from nitless.llm.base import (
+    Completion,
+    ModelCheck,
+    RateLimited,
+    ToolCall,
+    ToolChoiceRejected,
+    is_quota,
+    retry_delay_s,
+)
 from nitless.llm.openai_compat import OpenAICompatBackend
 
 KEYS = ("LLM_PROVIDER", "LLM_API_KEY", "LLM_BASE_URL", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY",
@@ -144,6 +152,18 @@ def test_quota_messages_are_told_apart_from_per_minute_limits():
     assert is_quota('{"code": "insufficient_quota"}')
     assert is_quota("Rate limit of 50 per 86400s exceeded for UserByModelByDay")
     assert not is_quota("Number of request tokens has exceeded your per-minute rate limit")
+
+
+GEMINI_429 = ("You exceeded your current quota, please check your plan and billing details. "
+              "[{'@type': 'type.googleapis.com/google.rpc.QuotaFailure', 'violations': [{'quotaId': '%s'}]}, "
+              "{'@type': 'type.googleapis.com/google.rpc.RetryInfo', 'retryDelay': '41s'}]")
+
+
+def test_gemini_per_minute_limits_are_waited_out_and_per_day_limits_are_a_quota():
+    per_minute = GEMINI_429 % "GenerateRequestsPerMinutePerProjectPerModel-FreeTier"
+    assert not is_quota(per_minute) and retry_delay_s(per_minute) == 41
+    assert is_quota(GEMINI_429 % "GenerateRequestsPerDayPerProjectPerModel-FreeTier")
+    assert is_quota("You exceeded your current quota, please check your plan and billing details.")  # OpenAI
 
 
 # --- Anthropic ------------------------------------------------------------

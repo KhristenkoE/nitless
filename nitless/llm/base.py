@@ -13,6 +13,11 @@ from typing import Any, Protocol
 # Billing or daily caps: waiting a minute will not help, so these are not retried.
 QUOTA_RE = re.compile(r"insufficient_quota|credit balance|billing|usage limit|spend limit|quota (exceeded|exhausted)"
                       r"|per 86400s|per day|daily (limit|quota)", re.I)
+# Gemini answers per-minute and per-day limits with the same "exceeded your current quota" text; the
+# quota id in the error details (`GenerateRequestsPerMinute...`) and a retry delay tell them apart.
+PER_DAY_RE = re.compile(r"PerDay", re.I)
+PER_MINUTE_RE = re.compile(r"PerMinute|per.minute|retryDelay", re.I)
+RETRY_DELAY_RE = re.compile(r"retryDelay['\"]?\s*:\s*['\"](\d+(?:\.\d+)?)s")
 
 
 @dataclass
@@ -80,4 +85,12 @@ class Backend(Protocol):
 
 
 def is_quota(message: str) -> bool:
-    return bool(QUOTA_RE.search(message))
+    if PER_DAY_RE.search(message):
+        return True
+    return bool(QUOTA_RE.search(message)) and not PER_MINUTE_RE.search(message)
+
+
+def retry_delay_s(message: str) -> float | None:
+    """The retry delay some providers put in the error body rather than a Retry-After header."""
+    m = RETRY_DELAY_RE.search(message)
+    return float(m.group(1)) if m else None
