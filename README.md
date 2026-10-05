@@ -1,5 +1,7 @@
 # nitless
 
+![Nitless](preview.png)
+
 AI code review for GitHub pull requests and GitLab merge requests. It reads the surrounding project (callers,
 callees, tests, docs, the task), not just the diff, and a second model pass tries to refute every finding
 before it is posted. Most runs produce a few findings, often none.
