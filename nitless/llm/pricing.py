@@ -11,6 +11,11 @@ PRICES: dict[str, tuple[float, float]] = {
     "claude-haiku-4-5-20251001": (1.0, 5.0),
 }
 
+# Prompt cache reads and writes, as a share of the input price (5-minute entries).
+CACHE_READ_RATE: dict[str, float] = {"claude-opus-5-5": 0.05}
+DEFAULT_CACHE_READ_RATE = 0.1
+CACHE_WRITE_RATE = 1.25
+
 
 def parse_prices(entries: list[str]) -> dict[str, tuple[float, float]]:
     """`model=input/output` entries, e.g. `gpt-x=1.25/10`."""
@@ -30,7 +35,10 @@ def cost_usd(usage: dict[str, ModelUsage], overrides: dict[str, tuple[float, flo
         if model not in table:
             return None
         inp, out = table[model]
-        total += (u.prompt_tokens * inp + u.completion_tokens * out) / 1_000_000
+        uncached = u.prompt_tokens - u.cache_read_tokens - u.cache_write_tokens
+        read = u.cache_read_tokens * CACHE_READ_RATE.get(model, DEFAULT_CACHE_READ_RATE)
+        total += ((uncached + read + u.cache_write_tokens * CACHE_WRITE_RATE) * inp + u.completion_tokens * out) \
+            / 1_000_000
     return round(total, 4)
 
 

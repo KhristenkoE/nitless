@@ -39,8 +39,10 @@ class Completion:
     text: str
     tool_calls: list[ToolCall]
     assistant_message: dict[str, Any]  # ready to append to the conversation
-    prompt_tokens: int = 0
+    prompt_tokens: int = 0  # all input tokens, cached or not
     completion_tokens: int = 0
+    cache_read_tokens: int = 0  # of prompt_tokens: served from the provider's prompt cache
+    cache_write_tokens: int = 0  # of prompt_tokens: written to it
 
 
 class BackendError(Exception):

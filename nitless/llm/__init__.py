@@ -168,6 +168,8 @@ class LLMClient:
             entry.calls += 1
             entry.prompt_tokens += response.prompt_tokens
             entry.completion_tokens += response.completion_tokens
+            entry.cache_read_tokens += response.cache_read_tokens
+            entry.cache_write_tokens += response.cache_write_tokens
 
 
 def _tool_spec(name: str, description: str, schema: type[BaseModel]) -> ToolSpec:

@@ -21,11 +21,11 @@ import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from nitless import __version__
+from nitless import __version__, incremental, prompts, repo_config
 from nitless.config import Settings
 from nitless.context import Profile, RelatedContext, build_profile, build_related
 from nitless.context.conventions import ConventionsCard, build_conventions
@@ -93,7 +93,10 @@ def run(settings: Settings, adapters: list[OutputAdapter]) -> int:
     try:
         with ExitStack() as stack:
             workdir = settings.workdir or Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="nitless-")))
-            result, change = _review(settings, llm, meta, workdir)
+            previous = _previous_state(adapters) if settings.incremental else None
+            result, change, settings = _review(settings, llm, meta, workdir, previous)
+            for adapter in adapters:  # the repository config may change how they post (STALE_COMMENTS)
+                adapter.settings = settings
     except ReviewerError as e:
         log.error("%s error: %s", e.kind, e)
         result = ReviewResult(status="error", run=meta, error=ErrorInfo(kind=e.kind, message=str(e)))
@@ -106,18 +109,31 @@ def run(settings: Settings, adapters: list[OutputAdapter]) -> int:
     return _publish(result, change, adapters) or exit_code
 
 
+def _previous_state(adapters: list[OutputAdapter]) -> incremental.ReviewState | None:
+    """The state the last review left where an adapter posts (the summary comment), if any adapter keeps one."""
+    for adapter in adapters:
+        if (state := adapter.previous_state()) is not None:
+            return state
+    return None
+
+
 def telemetry(meta: RunMeta) -> str:
     """One line for the end of every run: time, calls, tokens per model, cost."""
     calls = sum(u.calls for u in meta.usage.values())
     prompt = sum(u.prompt_tokens for u in meta.usage.values())
     completion = sum(u.completion_tokens for u in meta.usage.values())
+    cached = sum(u.cache_read_tokens for u in meta.usage.values())
     by_model = ", ".join(f"{m} {u.prompt_tokens + u.completion_tokens:,}" for m, u in meta.usage.items())
     cost = f"${meta.cost_usd:.4f}" if meta.cost_usd is not None else "n/a (no price for a model; see MODEL_PRICES)"
-    return (f"{meta.duration_s}s, {calls} LLM calls, {prompt:,} prompt + {completion:,} completion tokens"
+    return (f"{meta.duration_s}s, {calls} LLM calls, {prompt:,} prompt"
+            f"{f' ({cached:,} from cache)' if cached else ''} + {completion:,} completion tokens"
             f"{f' ({by_model})' if by_model else ''}, cost {cost}")
 
 
-def _review(settings: Settings, llm: LLMClient, meta: RunMeta, workdir: Path) -> tuple[ReviewResult, ChangeRequest]:
+def _review(settings: Settings, llm: LLMClient, meta: RunMeta, workdir: Path,
+            previous: incremental.ReviewState | None = None) -> tuple[ReviewResult, ChangeRequest, Settings]:
+    """The review; also returns the settings in effect once the repository's own config is applied."""
+    prompts.override({})
     llm.preflight(settings.models)
     explicit_task = None
     if settings.task_source:  # read before cloning: an unreadable task source fails the run (exit 5)
@@ -130,6 +146,20 @@ def _review(settings: Settings, llm: LLMClient, meta: RunMeta, workdir: Path) ->
     log.info("reviewing %s: %s (%s..%s)", change.ref, change.title, change.base_sha[:10], change.head_sha[:10])
 
     repo_dir = provider.checkout(change, workdir / "repo")
+    repo = repo_config.load(repo_dir, change.base_sha)
+    settings = repo_config.apply(settings, repo)
+    prompts.override(repo.prompts)
+    current = incremental.fingerprint(settings, repo)
+    inc = incremental.plan(settings, previous, change.head_sha, change.base_sha, current, repo_dir,
+                           lambda sha: provider.fetch_commit(repo_dir, sha))
+    if inc.mode != "full" or previous is not None:
+        log.info("review mode: %s (%s)", inc.mode, inc.reason)
+    if inc.mode == "unchanged" and inc.previous is not None:
+        result = inc.previous.result.model_copy(update={
+            "run": meta, "context_trace": {"incremental": inc.trace(), "repo_config": repo.trace()}})
+        result.state = incremental.ReviewState(head_sha=change.head_sha, base_sha=change.base_sha,
+                                               fingerprint=current, result=result, claims=inc.previous.claims)
+        return result, change, settings
     sel = select_files(repo_dir, change, settings, explicit_task)
     status = "partial" if sel.oversize else "ok"
     warnings = [f"diff exceeds MAX_DIFF_LINES={settings.max_diff_lines}; skipped {len(sel.oversize)} files"] \
@@ -139,15 +169,24 @@ def _review(settings: Settings, llm: LLMClient, meta: RunMeta, workdir: Path) ->
     if not files:
         return ReviewResult(status=status, run=meta, summary=summarize("No reviewable changes.", []),
                             skipped_files=skipped, warnings=warnings,
-                            context_trace={"triage": sel.triage.trace()}), change
+                            context_trace={"triage": sel.triage.trace(), "repo_config": repo.trace()}), change, settings
+    carried = inc.carried({f.path for f in files})
+    review_sel = sel
+    if inc.mode == "incremental":
+        changed = [f for f in files if f.path in inc.changed]
+        review_sel = replace(sel, files=changed, split=settings.max_units > 1
+                             and units.diff_tokens(changed) > settings.unit_budget_tokens)
+        log.info("incremental review: %d of %d files changed since %s, %d earlier findings re-verified",
+                 len(changed), len(files), inc.previous.head_sha[:8], len(carried))  # type: ignore[union-attr]
 
     profile, related = build_context(repo_dir, files, change.base_sha, settings, sel.index)
     intent, card = understand(settings, llm, sel.task, files, profile, related)
     warnings += card.warnings if card else []
-    review_units = plan_units(repo_dir, sel, related, change.base_sha, settings)
+    review_units = plan_units(repo_dir, review_sel, related, change.base_sha, settings) if review_sel.files else []
     tool_trace: list[dict] = []
-    reviewed = review_and_check(settings, llm, change, files, profile, review_units, related, intent, card, sel,
-                                tool_trace)
+    scope = incremental.scope_note(review_sel.files, files, inc) if inc.mode == "incremental" else ""
+    reviewed = review_and_check(settings, llm, change, files, profile, review_units, related, intent, card,
+                                review_sel, tool_trace, repo, scope)
     if reviewed.warnings:
         status, warnings = "partial", [*warnings, *reviewed.warnings]
 
@@ -158,11 +197,18 @@ def _review(settings: Settings, llm: LLMClient, meta: RunMeta, workdir: Path) ->
         candidates, merged = requirements.merge_findings(candidates, unmet, bool(intent.acceptance_criteria))
         notes += merged
     findings, dropped = validate(candidates, files, settings.severity_floor)
+    findings += [c for c in carried if c.id not in {f.id for f in findings}]
+    if settings.ignore_categories:
+        ignored = [f for f in findings if f.category in settings.ignore_categories]
+        findings = [f for f in findings if f not in ignored]
+        if ignored:
+            log.info("%d findings in ignored categories (%s) not verified or posted", len(ignored),
+                     ", ".join(settings.ignore_categories))
     for w in notes + dropped:
         log.warning(w)
 
-    material = verifier.build_material(repo_dir, change, files, profile, related, intent,
-                                       card.render() if card else "", sel.index)
+    rules = "\n\n".join(p for p in (repo.guidance([f.path for f in files]), card.render() if card else "") if p)
+    material = verifier.build_material(repo_dir, change, files, profile, related, intent, rules, sel.index)
     shown = {item.source for item in material.related}
     for unit in review_units:  # a split review: the verifier may use what any unit's reviewer saw
         material.related += [item for item in unit.related.included if item.source not in shown]
@@ -170,19 +216,28 @@ def _review(settings: Settings, llm: LLMClient, meta: RunMeta, workdir: Path) ->
     verification = verify(settings, llm, findings, material, _toolboxes(
         settings, sel.index, tool_trace, max(1, settings.max_tool_calls // 2), MAX_TOOL_TOKENS // 4))
     reqs = requirements.dispute(reqs, verification.refuted_criteria()) if reqs else None
-    assessment = verifier.restate(llm, settings.model_fast, reviewed.assessment, verification, reviewed.parts)
+    assessment = verifier.restate(llm, settings.model_fast, reviewed.assessment, verification, reviewed.parts) \
+        if review_units else (inc.previous.result.summary.assessment if inc.previous and inc.previous.result.summary
+                              else "No files changed since the last review.")
 
-    return ReviewResult(
+    result = ReviewResult(
         status=status, run=meta, summary=summarize(assessment, verification.published, reqs), requirements=reqs,
         findings=verification.published, skipped_files=skipped,
         warnings=warnings + notes + dropped + verification.warnings,
         context_trace={"profile": profile.trace(), "intent": intent.trace(),
                        "conventions": card.trace() if card else {"enabled": False}, "related": related.trace(),
-                       "triage": sel.triage.trace(), "units": reviewed.units,
+                       "triage": sel.triage.trace(), "repo_config": repo.trace(), "incremental": inc.trace(),
+                       "units": reviewed.units,
                        "tools": {"enabled": settings.tools, "calls": tool_trace},
                        "verification": verification.trace(),
                        "llm_usage_by_step": {k: v.model_dump() for k, v in llm.usage_by_tool.items()}},
-    ), change
+    )
+    published = {f.id for f in verification.published}
+    claims = [c.finding for c in verification.checks
+              if c.finding.id in published and c.finding.category != "requirements"]
+    result.state = incremental.ReviewState(head_sha=change.head_sha, base_sha=change.base_sha, fingerprint=current,
+                                           result=result, claims=claims)
+    return result, change, settings
 
 
 def select_files(repo_dir: Path, change: ChangeRequest, settings: Settings, explicit_task: TaskDocument | None
@@ -234,7 +289,8 @@ def understand(settings: Settings, llm: LLMClient, task: TaskDocument, files: li
 
 def review_and_check(settings: Settings, llm: LLMClient, change: ChangeRequest, files: list[FileDiff],
                      profile: Profile, review_units: list[units.Unit], related: RelatedContext, intent: Intent,
-                     card: ConventionsCard | None, sel: Selection, tool_trace: list[dict]) -> Reviewed:
+                     card: ConventionsCard | None, sel: Selection, tool_trace: list[dict],
+                     repo: repo_config.RepoConfig | None = None, scope: str = "") -> Reviewed:
     """Every unit's reviewer and the requirements check, concurrently. The check degrades to a warning, and so
     does a failed unit while another one succeeds; with every unit failed the review fails. A spent daily token
     quota always fails it: a partial review that reads as clean is worse than a loud exit 7."""
@@ -243,9 +299,12 @@ def review_and_check(settings: Settings, llm: LLMClient, change: ChangeRequest, 
 
     def review_unit(n: int, unit: units.Unit) -> ReviewSubmission:
         conventions = (card.render_for(unit.paths) if count > 1 else card.render()) if card else ""
+        guidance = repo.guidance(unit.paths) if repo else ""
+        conventions = "\n\n".join(part for part in (guidance, conventions) if part)
         return naive.review(llm, settings.model_strong, change, unit.files, profile_text, unit.related.render(),
                             conventions, intent.render(),
-                            units.scope_note(unit, n, count, files, sel.triage) if sel.split else "",
+                            "\n\n".join(p for p in (scope, units.scope_note(unit, n, count, files, sel.triage)
+                                                      if sel.split else "") if p),
                             toolbox(f"unit {n}") if toolbox else None)
 
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as pool:
@@ -268,7 +327,7 @@ def review_and_check(settings: Settings, llm: LLMClient, change: ChangeRequest, 
             log.warning("review of unit %d failed: %s", n, e)
             failures.append((n, unit, e))
             rows.append({**row, "status": "failed", "error": str(e)})
-    if not submissions:
+    if failures and not submissions:
         raise failures[0][2]
     log.info("reviewed %d units in %.1fs", count, time.monotonic() - started)
     candidates, notes = dedupe_units([s.findings for _, s in submissions])

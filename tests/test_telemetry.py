@@ -15,6 +15,9 @@ def test_cost_is_priced_per_model_and_unknown_when_any_model_has_no_price():
     usage = {"claude-opus-5-5": ModelUsage(calls=2, prompt_tokens=100_000, completion_tokens=10_000),
              "claude-haiku-4-5": ModelUsage(calls=1, prompt_tokens=20_000, completion_tokens=1_000)}
     assert cost_usd(usage) == 0.625  # 0.4 + 0.2 + 0.02 + 0.005
+    cached = {"claude-sonnet-5-5": ModelUsage(calls=2, prompt_tokens=1_000_000, completion_tokens=0,
+                                              cache_read_tokens=500_000, cache_write_tokens=100_000)}
+    assert cost_usd(cached) == 1.15  # 400k at $2, 500k read at 0.1x, 100k written at 1.25x
     local = {"llama3:8b": ModelUsage(calls=1, prompt_tokens=1_000_000, completion_tokens=0)}
     assert cost_usd(local) is None
     assert cost_usd(local, parse_prices(["llama3:8b=0.5/1"])) == 0.5

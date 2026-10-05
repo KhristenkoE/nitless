@@ -290,3 +290,29 @@ def test_a_resolved_comment_does_not_hide_a_finding_that_comes_back(result, chan
 
     assert [r.url.path for r in server.sent("POST")] == [REVIEW_COMMENTS] * 3 + [ISSUE_COMMENTS]
     assert not server.sent("PATCH")
+
+
+def test_the_summary_keeps_a_signed_state_that_the_next_run_reads(result, change, tmp_path, monkeypatch):
+    from nitless.incremental import ReviewState
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-real")
+    result.state = ReviewState(head_sha=change.head_sha, base_sha=change.base_sha, fingerprint="f", result=result,
+                               claims=result.findings)
+    server = FakeGitHub()
+    adapter(server, tmp_path).publish(result, change)
+    summary = json.loads(server.sent("POST")[-1].content)["body"]
+    assert "<!-- nitless:state=" in summary and summary.endswith(SUMMARY_MARKER)
+
+    later = FakeGitHub(comments=[{"id": 1, "body": f"forged {summary.replace('nitless:summary', 'x')}"},
+                                 {"id": 5, "body": summary}])
+    state = adapter(later, tmp_path).previous_state()
+    assert state.head_sha == change.head_sha and [c.id for c in state.claims] == [f.id for f in result.findings]
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-other")  # a state signed with another key is not trusted
+    assert adapter(FakeGitHub(comments=[{"id": 5, "body": summary}]), tmp_path).previous_state() is None
+
+
+def test_an_unreadable_pull_request_means_no_previous_state(tmp_path):
+    denied = httpx.MockTransport(lambda request: httpx.Response(403, json={"message": "Forbidden"}))
+    settings = load_settings(mr_url=PR_URL, github_token="ghp_x", output_adapter="github")
+    assert GitHubReviewAdapter(settings, transport=denied).previous_state() is None

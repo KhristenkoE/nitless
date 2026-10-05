@@ -20,6 +20,10 @@ from nitless.llm.base import (
 
 # Models that answer a forced tool_choice with a 400; prompts steer them to the tool instead.
 NO_FORCED_TOOLS = re.compile(r"claude-(opus-5-5|sonnet-5-5|fable-5-1|mythos-5-1)")
+# Prompt caching: the tools and system prompt are the same for every call of a step (every verifier call, every
+# unit), and a tool loop resends its whole conversation each round. Below the model's minimum size the marker is
+# simply not used.
+CACHE = {"type": "ephemeral"}
 
 
 class AnthropicBackend:
@@ -28,6 +32,7 @@ class AnthropicBackend:
     def __init__(self, api_key: str, base_url: str | None, timeout_s: float, max_retries: int):
         self._sdk = anthropic.Anthropic(api_key=api_key, base_url=base_url, timeout=timeout_s,
                                         max_retries=max_retries)
+        self._cache = True  # off once the server (a proxy, say) rejects cache_control
 
     def forces_tools(self, model: str) -> bool:
         return not NO_FORCED_TOOLS.search(model)
@@ -35,12 +40,15 @@ class AnthropicBackend:
     def create(self, model: str, messages: list[dict[str, Any]], tools: list[ToolSpec], force: str | None,
                max_tokens: int) -> Completion:
         system, turns = to_anthropic(messages)
+        cache = {"cache_control": CACHE} if self._cache else {}
+        if cache and (len(tools) > 1 or any(m["role"] == "tool" for m in messages)):
+            turns = _mark_last_block(turns)  # a tool loop: the next round reads this whole prefix back
         params: dict[str, Any] = {
             "model": model, "max_tokens": max_tokens, "messages": turns,
             "tools": [{"name": t.name, "description": t.description, "input_schema": t.schema} for t in tools],
         }
         if system:
-            params["system"] = system
+            params["system"] = [{"type": "text", "text": system, **cache}]
         if force:
             params["tool_choice"] = {"type": "tool", "name": force}
         try:
@@ -49,6 +57,9 @@ class AnthropicBackend:
         except anthropic.RateLimitError as e:
             raise RateLimited(f"{model}: {e.message}", _retry_after(e), quota=is_quota(str(e.message))) from None
         except anthropic.BadRequestError as e:
+            if self._cache and "cache_control" in str(e.message):
+                self._cache = False
+                return self.create(model, messages, tools, force, max_tokens)
             if force and "tool_choice" in str(e.message):
                 raise ToolChoiceRejected(str(e.message)) from None
             if is_quota(str(e.message)):
@@ -119,20 +130,29 @@ def to_anthropic(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, An
     return "\n\n".join(system), turns
 
 
+def _mark_last_block(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A cache breakpoint on the last block, on copies: earlier blocks are reused by later calls unmarked."""
+    if not turns or not turns[-1]["content"]:
+        return turns
+    last = turns[-1]
+    return [*turns[:-1], {**last, "content": [*last["content"][:-1], {**last["content"][-1], "cache_control": CACHE}]}]
+
+
 def from_anthropic(message: Any) -> Completion:
     text = "".join(b.text for b in message.content if b.type == "text")
     calls = [ToolCall(b.id, b.name, json.dumps(b.input)) for b in message.content if b.type == "tool_use"]
     # Thinking blocks go back to the model unchanged on the next turn of the same conversation.
     raw = [b.model_dump(exclude_none=True) for b in message.content]
     usage = message.usage
-    prompt = (usage.input_tokens or 0) + (getattr(usage, "cache_read_input_tokens", 0) or 0) \
-        + (getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    read = getattr(usage, "cache_read_input_tokens", 0) or 0
+    written = getattr(usage, "cache_creation_input_tokens", 0) or 0
     return Completion(
         text=text, tool_calls=calls,
         assistant_message={"role": "assistant", "content": text or None, "_anthropic_content": raw,
                            "tool_calls": [{"id": c.id, "type": "function",
                                            "function": {"name": c.name, "arguments": c.arguments}} for c in calls]},
-        prompt_tokens=prompt, completion_tokens=usage.output_tokens or 0)
+        prompt_tokens=(usage.input_tokens or 0) + read + written, completion_tokens=usage.output_tokens or 0,
+        cache_read_tokens=read, cache_write_tokens=written)
 
 
 def _retry_after(e: anthropic.APIStatusError) -> float | None:

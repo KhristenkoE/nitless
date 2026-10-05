@@ -1,6 +1,7 @@
 import json
 from types import SimpleNamespace
 
+import anthropic
 import httpx
 import openai
 import pytest
@@ -17,6 +18,7 @@ from nitless.llm.base import (
     RateLimited,
     ToolCall,
     ToolChoiceRejected,
+    ToolSpec,
     is_quota,
     retry_delay_s,
 )
@@ -179,7 +181,6 @@ def test_an_overloaded_provider_is_waited_out_like_a_rate_limit():
 
     backend = OpenAICompatBackend("gemini", "k", None, 1, 0)
     backend._sdk = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    from nitless.llm.base import ToolSpec
 
     with pytest.raises(RateLimited) as e:
         backend.create("m", [], [ToolSpec("s", "", {})], None, 10)
@@ -228,8 +229,66 @@ def test_an_anthropic_message_becomes_a_completion_with_cache_tokens_counted():
                               output_tokens=5))
     c = from_anthropic(message)
     assert c.text == "Checking." and c.tool_calls == [ToolCall("t1", "submit", '{"verdict": "keep"}')]
-    assert (c.prompt_tokens, c.completion_tokens) == (100, 5)
+    assert (c.prompt_tokens, c.completion_tokens, c.cache_read_tokens, c.cache_write_tokens) == (100, 5, 90, 0)
     assert c.assistant_message["_anthropic_content"][0]["type"] == "thinking"
+
+
+class FakeStream:
+    def __init__(self, sent, fail=None):
+        self.sent, self.fail = sent, fail
+
+    def __call__(self, **params):
+        self.sent.append(params)
+        if self.fail and len(self.sent) == 1:
+            raise anthropic.BadRequestError(self.fail, response=httpx.Response(
+                400, request=httpx.Request("POST", "http://x")), body=None)
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get_final_message(self):
+        return SimpleNamespace(content=[block(type="text", text="ok")],
+                               usage=SimpleNamespace(input_tokens=1, output_tokens=1))
+
+
+def anthropic_backend(sent, fail=None):
+    backend = AnthropicBackend("k", None, 1, 0)
+    backend._sdk = SimpleNamespace(messages=SimpleNamespace(stream=FakeStream(sent, fail)))
+    return backend
+
+
+GREP = ToolSpec("grep", "", {"type": "object"})
+SUBMIT = ToolSpec("submit", "", {"type": "object"})
+
+
+def test_the_system_prompt_is_cached_and_a_tool_loop_caches_its_conversation():
+    sent = []
+    backend = anthropic_backend(sent)
+    single = [{"role": "system", "content": "Be strict."}, {"role": "user", "content": "Review this."}]
+    backend.create("m", single, [SUBMIT], None, 100)
+    assert sent[0]["system"] == [{"type": "text", "text": "Be strict.", "cache_control": {"type": "ephemeral"}}]
+    assert "cache_control" not in sent[0]["messages"][-1]["content"][-1]  # one call: its tail is never read back
+
+    raw = [{"type": "tool_use", "id": "t1", "name": "grep", "input": {}}]
+    loop = [*single, {"role": "assistant", "content": None, "_anthropic_content": raw},
+            {"role": "tool", "tool_call_id": "t1", "content": "a.py:1"}]
+    backend.create("m", loop, [GREP, SUBMIT], None, 100)
+    assert sent[1]["messages"][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert all("cache_control" not in b for t in sent[1]["messages"][:-1] for b in t["content"])
+    assert "cache_control" not in raw[0]  # the conversation's own blocks are left unmarked
+
+
+def test_a_server_rejecting_cache_control_is_called_without_it():
+    sent = []
+    backend = anthropic_backend(sent, fail="cache_control: Extra inputs are not permitted")
+    c = backend.create("m", [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}], [SUBMIT], None, 9)
+    assert c.text == "ok" and sent[1]["system"] == [{"type": "text", "text": "S"}]
+    backend.create("m", [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}], [SUBMIT], None, 9)
+    assert len(sent) == 3  # remembered: no second rejected call
 
 
 def test_current_claude_models_are_not_forced():
@@ -253,7 +312,6 @@ def test_chat_completions_requests_drop_private_keys_and_parse_tool_calls():
 
     backend = OpenAICompatBackend("openai", "k", None, 1, 0)
     backend._sdk = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    from nitless.llm.base import ToolSpec
 
     c = backend.create("m", [{"role": "assistant", "content": "x", "_anthropic_content": [], "tool_calls": []}],
                        [ToolSpec("submit", "Answer.", {"type": "object"})], "submit", 100)

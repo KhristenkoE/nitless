@@ -96,3 +96,16 @@ These runs used Sonnet 5 with the verifier off, unless noted.
 - **Units and tools were not measured on Opus.**
 - **Triage never dropped a hunk that held a planted issue.**
 - **Small MRs keep exactly the same prompts** as before units were added.
+
+## Team rules
+
+`py-readiness-team-rule` is the `py-readiness-probe` change under a rule that only `.nitless.yml` states
+("health probes never log"). Without the file the same change is a silent case.
+
+| Case                     | Model                         | Result                                     |
+| ------------------------ | ----------------------------- | ------------------------------------------ |
+| `py-readiness-team-rule` | gemini-3.7-flash, verifier on | caught, `convention` on the log line, 0 fp |
+| `py-readiness-probe`     | gemini-3.7-flash, verifier on | silent                                     |
+
+- **One repeat on a free-tier model.** It shows the rule reaches the reviewer and survives the verifier; it is
+  not a recall number.

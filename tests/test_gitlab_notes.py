@@ -209,3 +209,17 @@ def test_partial_run_leaves_stale_discussions(result, change, tmp_path):
     adapter(server, tmp_path).publish(result.model_copy(update={"status": "partial"}), change)
 
     assert not server.sent("PUT") and not server.sent("DELETE")
+
+
+def test_the_summary_note_keeps_a_state_that_the_next_run_reads(result, change, tmp_path):
+    from nitless.incremental import ReviewState
+
+    result.state = ReviewState(head_sha=change.head_sha, base_sha=change.base_sha, fingerprint="f", result=result,
+                               claims=result.findings)
+    server = FakeGitLab()
+    adapter(server, tmp_path).publish(result, change)
+    summary = json.loads(server.sent("POST")[-1].content)["body"]
+    assert "<!-- nitless:state=" in summary
+
+    state = adapter(FakeGitLab(notes=[{"id": 5, "body": summary}]), tmp_path).previous_state()
+    assert state.head_sha == change.head_sha

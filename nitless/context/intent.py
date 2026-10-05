@@ -18,7 +18,6 @@ import logging
 import posixpath
 import re
 from dataclasses import dataclass
-from importlib import resources
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote, urlparse
@@ -27,6 +26,7 @@ import httpx
 import yaml
 from pydantic import BaseModel, Field, SecretStr
 
+from nitless import prompts
 from nitless.context.base import read_text
 from nitless.errors import LLMError, TaskSourceError
 from nitless.llm import LLMClient
@@ -34,7 +34,6 @@ from nitless.models import ChangeRequest, IntentKind
 
 log = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = resources.files("nitless.prompts").joinpath("intent_system.md").read_text()
 STORY_FILES = ("story.json", "task.json", ".task.json", "story.md", "TASK.md")  # first match wins, root first
 MAX_SOURCE_CHARS = 30_000
 MIN_GROUNDING = 0.6  # share of an extracted item's words that must occur in the source text
@@ -282,7 +281,7 @@ def parse_intent(doc: TaskDocument, llm: LLMClient | None, model: str) -> Intent
 def extract(llm: LLMClient, model: str, doc: TaskDocument) -> TaskExtraction:
     where = "a merge request description" if doc.kind == "mr" else f"a task ({doc.source})"
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": prompts.get("intent_system")},
         {"role": "user", "content": f"Extract the task from {where}:\n\n<text>\n{doc.text[:MAX_SOURCE_CHARS]}\n"
                                     "</text>"},
     ]

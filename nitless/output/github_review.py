@@ -9,6 +9,7 @@ import httpx
 
 from nitless.config import Settings
 from nitless.errors import ConfigError, PublishError
+from nitless.incremental import ReviewState, parse_state
 from nitless.models import ChangeRequest, Finding, ReviewResult
 from nitless.output.base import OutputAdapter
 from nitless.output.gitlab_notes import FINGERPRINT_RE, SUMMARY_MARKER, fingerprint
@@ -54,13 +55,27 @@ class GitHubReviewAdapter(OutputAdapter):
         if not self.settings.github_token:
             raise ConfigError("the github adapter needs GITHUB_TOKEN with pull request write access to post comments")
 
-    def publish(self, result: ReviewResult, change: ChangeRequest | None) -> None:
-        if change is None:
-            raise PublishError("nothing to post: the change was not resolved")
+    def _connect(self) -> PullRequestRef:
         ref = parse_pr_url(self.settings.mr_url)  # type: ignore[arg-type]  (validate() checked)
         token = self.settings.github_token.get_secret_value()  # type: ignore[union-attr]
         headers = {**API_HEADERS, "Authorization": f"Bearer {token}"}
         self._http = httpx.Client(base_url=ref.api_url, headers=headers, timeout=30, transport=self._transport)
+        return ref
+
+    def previous_state(self) -> ReviewState | None:
+        ref = self._connect()
+        try:
+            comments = self._list(f"/repos/{ref.owner}/{ref.repo}/issues/{ref.number}/comments")
+        except PublishError as e:
+            log.info("github: cannot read the previous review (%s), reviewing in full", e)
+            return None
+        summary = next((c.get("body") or "" for c in comments if SUMMARY_MARKER in (c.get("body") or "")), "")
+        return parse_state(summary, self.settings.llm_key)
+
+    def publish(self, result: ReviewResult, change: ChangeRequest | None) -> None:
+        if change is None:
+            raise PublishError("nothing to post: the change was not resolved")
+        ref = self._connect()
         repo = f"/repos/{ref.owner}/{ref.repo}"
         issue, pulls = f"{repo}/issues/{ref.number}", f"{repo}/pulls/{ref.number}"
         dry_run = self.settings.github_dry_run
@@ -95,6 +110,8 @@ class GitHubReviewAdapter(OutputAdapter):
         body = render(result, change, inline=inline).rstrip()
         if summary_id is not None:
             body += f"\n\n_Updated for {change.head_sha[:8]}._"
+        if result.state is not None and (state := result.state.marker(self.settings.llm_key)):
+            body += f"\n\n{state}"
         body += f"\n\n{SUMMARY_MARKER}"
         method, path = (("PATCH", f"{repo}/issues/comments/{summary_id}") if summary_id is not None
                         else ("POST", f"{issue}/comments"))

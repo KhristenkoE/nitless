@@ -79,13 +79,14 @@ def main() -> int:
 
 
 def check_case(case: CaseSpec, repo: Path, settings: Settings) -> CaseResult:
-    change = ChangeRequest(provider="local", repo=str(repo), ref="HEAD", title=case.title, base_sha="main",
-                           start_sha="main", head_sha="HEAD")
+    base = case.base_ref
+    change = ChangeRequest(provider="local", repo=str(repo), ref="HEAD", title=case.title, base_sha=base,
+                           start_sha=base, head_sha="HEAD")
     started = time.monotonic()
     sel = select_files(repo, change, settings, None)
     files = sel.files
-    profile, related = build_context(repo, files, "main", settings, sel.index)
-    parts = plan_units(repo, sel, related, "main", settings)
+    profile, related = build_context(repo, files, base, settings, sel.index)
+    parts = plan_units(repo, sel, related, base, settings)
     seconds = time.monotonic() - started
     shown = RelatedContext([item for u in parts for item in u.related.included],
                            [item for u in parts for item in u.related.dropped])

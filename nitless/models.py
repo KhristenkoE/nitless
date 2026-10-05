@@ -1,7 +1,7 @@
 """Public data model: the change under review and the review result (the JSON output schema)."""
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -73,8 +73,10 @@ class Summary(BaseModel):
 
 class ModelUsage(BaseModel):
     calls: int = 0
-    prompt_tokens: int = 0
+    prompt_tokens: int = 0  # all input tokens, including cache reads and writes
     completion_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
 
 
 class RunMeta(BaseModel):
@@ -130,3 +132,4 @@ class ReviewResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     error: ErrorInfo | None = None
     context_trace: dict = Field(default_factory=dict)
+    state: Any = Field(default=None, exclude=True)  # nitless.incremental.ReviewState, kept by posting adapters

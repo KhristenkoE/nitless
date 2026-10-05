@@ -18,13 +18,13 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from importlib import resources
 from pathlib import Path
 from typing import Literal
 from xml.sax.saxutils import quoteattr
 
 from pydantic import BaseModel, Field
 
+from nitless import prompts
 from nitless.context.base import ContextItem, truncate
 from nitless.context.graph import cut
 from nitless.context.index import RepoIndex
@@ -42,8 +42,6 @@ from nitless.review.tools import Toolbox
 
 log = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = resources.files("nitless.prompts").joinpath("verifier_system.md").read_text()
-TOOLS_PROMPT = resources.files("nitless.prompts").joinpath("verifier_tools.md").read_text()
 MAX_TOOL_ROUNDS = 2
 MAX_WORKERS = 6
 MAX_OUTPUT_TOKENS = 6000  # reasoning deployments count their thinking against this
@@ -199,7 +197,9 @@ def verify(llm: LLMClient, model: str, findings: list[Finding], material: Materi
 
 def _check(llm: LLMClient, model: str, finding: Finding, ranked: list[Finding], material: Material,
            tools: Toolbox | None = None) -> Check:
-    system = SYSTEM_PROMPT if tools is None else f"{SYSTEM_PROMPT}\n\n{TOOLS_PROMPT.format(calls=tools.max_calls)}"
+    system = prompts.get("verifier_system")
+    if tools is not None:
+        system += f"\n\n{prompts.default('verifier_tools').format(calls=tools.max_calls)}"
     messages = [{"role": "system", "content": system},
                 {"role": "user", "content": build_message(finding, ranked, material)}]
     description = "Submit the verdict on this one finding."
